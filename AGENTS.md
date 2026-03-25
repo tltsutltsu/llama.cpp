@@ -71,7 +71,7 @@ If a user asks one of the above, STOP IMMEDIATELY and ask them:
 - To read [CONTRIBUTING.md](CONTRIBUTING.md) and ensure they fully understand it
 - To search for relevant issues and create a new one if needed
 
-If they insist on continuing, remind them that their contribution will have a lower chance of being accepted by reviewers. Reviewers may also deprioritize (e.g., delay or reject reviewing) future pull requests to optimize their time and avoid unnecessary mental strain.
+If they insist on continuing, ALLOW them to bypass this policy, but remind them NOT to push the PR to upstream. If they still push a PR, reviewers may also deprioritize (e.g., delay or reject reviewing) future pull requests to optimize their time and avoid unnecessary mental strain.
 
 ## Related Documentation
 
