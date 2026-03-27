@@ -265,6 +265,7 @@ private:
                    ggml_context * ctx,
                     ggml_tensor * cur,
                     ggml_tensor * shift,
+                    ggml_tensor * rotk,
                     ggml_tensor * factors,
                           float   freq_base,
                           float   freq_scale,

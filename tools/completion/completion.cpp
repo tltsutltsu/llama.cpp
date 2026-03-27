@@ -628,7 +628,7 @@ int main(int argc, char ** argv) {
                     const int n_left    = n_past - params.n_keep;
                     const int n_discard = n_left/2;
 
-                    LOG_DBG("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
+                    LOG_WRN("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
                             n_past, n_left, n_ctx, params.n_keep, n_discard);
 
                     llama_memory_seq_rm (mem, 0, params.n_keep            , params.n_keep + n_discard);
