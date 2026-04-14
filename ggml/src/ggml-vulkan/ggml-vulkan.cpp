@@ -10054,7 +10054,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             // Cap X workgroups to limit concurrent IC channel reads.
             // The shader loops over X to cover the full CHW dimension.
             // AMD prefers a lower limit
-            const uint32_t min_cap = ctx->device->subgroup_size > 32 ? 512u : 4096u;
+            const uint32_t min_cap = ctx->device->vendor_id == VK_VENDOR_ID_AMD ? 512u : 4096u;
             const uint32_t x_elements = std::min(CHW, std::max(min_cap, OW * KH * KW));
             elements = { x_elements, OW, OH * batch };
             elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
