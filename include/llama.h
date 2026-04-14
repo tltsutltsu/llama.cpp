@@ -1313,6 +1313,12 @@ extern "C" {
 
     // available samplers:
 
+    enum llama_temp_schedule_interp {
+        LLAMA_TEMP_SCHEDULE_INTERP_STEP   = 0,
+        LLAMA_TEMP_SCHEDULE_INTERP_LINEAR = 1,
+        LLAMA_TEMP_SCHEDULE_INTERP_CUBIC  = 2, // Catmull-Rom spline
+    };
+
     LLAMA_API struct llama_sampler * llama_sampler_init_greedy(void);
 
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
@@ -1336,6 +1342,21 @@ extern "C" {
 
     /// @details Dynamic temperature implementation (a.k.a. entropy) described in the paper https://arxiv.org/abs/2309.02772.
     LLAMA_API struct llama_sampler * llama_sampler_init_temp_ext   (float   t, float   delta, float exponent);
+
+    /// @details Temperature schedule sampler — position-dependent temperature.
+    /// @param points     Interleaved [pos0, temp0, pos1, temp1, ...]. Copied internally.
+    /// @param n_points   Number of (position, temperature) pairs.
+    /// @param interp     Interpolation mode (step, linear, cubic).
+    /// @param normalized If true, position values are fractions of n_predict (0.0–1.0).
+    ///                   Requires n_predict > 0.
+    /// @param n_predict  Total expected generation length. Only used when normalized=true.
+    ///                   Ignored (pass 0) when normalized=false.
+    LLAMA_API struct llama_sampler * llama_sampler_init_temp_schedule(
+            const float * points,
+            int32_t       n_points,
+            enum llama_temp_schedule_interp interp,
+            bool          normalized,
+            int32_t       n_predict);
 
     /// @details XTC sampler as described in https://github.com/oobabooga/text-generation-webui/pull/6335
     LLAMA_API struct llama_sampler * llama_sampler_init_xtc        (float   p, float   t,     size_t min_keep, uint32_t seed);

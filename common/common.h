@@ -166,6 +166,8 @@ enum common_params_sampling_config : uint64_t {
     COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT        = 1 << 9,
     COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU    = 1 << 10,
     COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA    = 1 << 11,
+    COMMON_PARAMS_SAMPLING_CONFIG_TEMP_SCHEDULE   = 1 << 12,
+    COMMON_PARAMS_SAMPLING_CONFIG_DYNATEMP_RANGE  = 1 << 13,
 };
 
 enum common_speculative_type {
@@ -233,6 +235,9 @@ struct common_params_sampling {
     float   temp               = 0.80f;  // <= 0.0 to sample greedily, 0.0 to not output probabilities
     float   dynatemp_range     = 0.00f;  // 0.0 = disabled
     float   dynatemp_exponent  = 1.00f;  // controls how entropy maps to temperature in dynamic temperature sampler
+    std::vector<std::pair<float, float>> temp_schedule;          // position-dependent temperature control points
+    llama_temp_schedule_interp temp_schedule_interp = LLAMA_TEMP_SCHEDULE_INTERP_LINEAR;
+    bool temp_schedule_needs_normalization = false;               // transient: set by --temp-schedule-normalized, consumed by post-parse step
     int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty, -1 = context size)
     float   penalty_repeat     = 1.00f;  // 1.0 = disabled
     float   penalty_freq       = 0.00f;  // 0.0 = disabled

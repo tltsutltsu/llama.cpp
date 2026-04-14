@@ -30,6 +30,7 @@
 #include <list>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread> // for hardware_concurrency
 #include <vector>
@@ -569,6 +570,29 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     postprocess_cpu_params(params.speculative.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.cpuparams_batch, &params.cpuparams_batch);
+
+    // Post-parse normalization for temperature schedule
+    if (params.sampling.temp_schedule_needs_normalization) {
+        if (params.n_predict <= 0) {
+            throw std::invalid_argument("error: --temp-schedule-normalized requires --n-predict > 0\n");
+        }
+        float scale = (float)(params.n_predict - 1);
+        if (params.n_predict == 1) { scale = 0.0f; }
+        for (auto & cp : params.sampling.temp_schedule) {
+            cp.first *= scale;
+        }
+        params.sampling.temp_schedule_needs_normalization = false;
+    }
+
+    // Warn if temp_schedule conflicts with temperature or dynatemp_range
+    if (!params.sampling.temp_schedule.empty()) {
+        if (params.sampling.user_sampling_config & common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP) {
+            LOG_WRN("%s: --temp-schedule overrides --temp\n", __func__);
+        }
+        if (params.sampling.user_sampling_config & common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_DYNATEMP_RANGE) {
+            LOG_WRN("%s: --temp-schedule overrides --dynatemp-range\n", __func__);
+        }
+    }
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
@@ -1780,6 +1804,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("dynamic temperature range (default: %.2f, 0.0 = disabled)", (double)params.sampling.dynatemp_range),
         [](common_params & params, const std::string & value) {
             params.sampling.dynatemp_range = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_DYNATEMP_RANGE;
         }
     ).set_sparam());
     add_opt(common_arg(
@@ -1787,6 +1812,61 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("dynamic temperature exponent (default: %.2f)", (double)params.sampling.dynatemp_exponent),
         [](common_params & params, const std::string & value) {
             params.sampling.dynatemp_exponent = std::stof(value);
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--temp-schedule"}, "SCHEDULE",
+        "temperature schedule as pos0:temp0,pos1:temp1,... (absolute token positions)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.temp_schedule.clear();
+            params.sampling.temp_schedule_needs_normalization = false;
+            std::istringstream ss(value);
+            std::string pair_str;
+            while (std::getline(ss, pair_str, ',')) {
+                auto colon = pair_str.find(':');
+                if (colon == std::string::npos) {
+                    throw std::invalid_argument("invalid temp-schedule format, expected pos:temp pairs");
+                }
+                float pos  = std::stof(pair_str.substr(0, colon));
+                float temp = std::stof(pair_str.substr(colon + 1));
+                params.sampling.temp_schedule.emplace_back(pos, temp);
+            }
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP_SCHEDULE;
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--temp-schedule-normalized"}, "SCHEDULE",
+        "temperature schedule as frac0:temp0,frac1:temp1,... (positions are fractions of --n-predict)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.temp_schedule.clear();
+            params.sampling.temp_schedule_needs_normalization = true;
+            std::istringstream ss(value);
+            std::string pair_str;
+            while (std::getline(ss, pair_str, ',')) {
+                auto colon = pair_str.find(':');
+                if (colon == std::string::npos) {
+                    throw std::invalid_argument("invalid temp-schedule-normalized format, expected frac:temp pairs");
+                }
+                float pos  = std::stof(pair_str.substr(0, colon));
+                float temp = std::stof(pair_str.substr(colon + 1));
+                params.sampling.temp_schedule.emplace_back(pos, temp);
+            }
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP_SCHEDULE;
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--temp-schedule-interp"}, "METHOD",
+        "temperature schedule interpolation method: step, linear, cubic (default: linear)",
+        [](common_params & params, const std::string & value) {
+            if (value == "step") {
+                params.sampling.temp_schedule_interp = LLAMA_TEMP_SCHEDULE_INTERP_STEP;
+            } else if (value == "linear") {
+                params.sampling.temp_schedule_interp = LLAMA_TEMP_SCHEDULE_INTERP_LINEAR;
+            } else if (value == "cubic") {
+                params.sampling.temp_schedule_interp = LLAMA_TEMP_SCHEDULE_INTERP_CUBIC;
+            } else {
+                throw std::invalid_argument("invalid temp-schedule-interp value: " + value);
+            }
         }
     ).set_sparam());
     add_opt(common_arg(

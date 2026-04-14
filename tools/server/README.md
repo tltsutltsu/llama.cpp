@@ -146,6 +146,9 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--adaptive-decay N` | adaptive-p: decay rate for target adaptation over time. lower values are more reactive, higher values are more stable.<br/>(valid range 0.0 to 0.99) (default: 0.90) |
 | `--dynatemp-range N` | dynamic temperature range (default: 0.00, 0.0 = disabled) |
 | `--dynatemp-exp N` | dynamic temperature exponent (default: 1.00) |
+| `--temp-schedule SCHEDULE` | temperature schedule as `pos0:temp0,pos1:temp1,...` (absolute token positions). Overrides `--temp` and `--dynatemp-range`. |
+| `--temp-schedule-normalized SCHEDULE` | temperature schedule as `frac0:temp0,frac1:temp1,...` where positions are fractions of `--n-predict` (0.0–1.0). Requires `--n-predict > 0`. |
+| `--temp-schedule-interp METHOD` | temperature schedule interpolation: `step`, `linear`, or `cubic` (Catmull-Rom). Default: `linear`. |
 | `--mirostat N` | use Mirostat sampling.<br/>Top K, Nucleus and Locally Typical samplers are ignored if used.<br/>(default: 0, 0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0) |
 | `--mirostat-lr N` | Mirostat learning rate, parameter eta (default: 0.10) |
 | `--mirostat-ent N` | Mirostat target entropy, parameter tau (default: 5.00) |
@@ -412,6 +415,14 @@ Note for `multimodal_data` in JSON object prompts. This should be an array of st
 `dynatemp_range`: Dynamic temperature range. The final temperature will be in the range of `[temperature - dynatemp_range; temperature + dynatemp_range]` Default: `0.0`, which is disabled.
 
 `dynatemp_exponent`: Dynamic temperature exponent. Default: `1.0`
+
+`temperature_schedule`: Array of `[position, temperature]` pairs defining a position-dependent temperature curve. When set, overrides `temperature` and `dynatemp_range`. Example: `[[0, 1.0], [50, 0.8], [200, 0.5]]`. Default: not set.
+
+`temperature_interpolation`: Interpolation method for `temperature_schedule`. One of `"step"`, `"linear"`, or `"cubic"` (Catmull-Rom spline). Default: `"linear"`.
+
+`temperature_schedule_normalized`: When `true`, treat `temperature_schedule` positions as fractions of `n_predict` (0.0–1.0) instead of absolute token positions. Requires `n_predict > 0`. Only applied when `temperature_schedule` is also present in the same request. Default: `false`.
+
+**Limitations**: The position counter resets to 0 at the start of each generation and counts only generated tokens (prompt tokens do not advance the counter). If continuing a previous generation (appending to an existing completion), the schedule restarts from position 0. Normalized position 1.0 maps to position `n_predict - 1` (the last generated token).
 
 `top_k`: Limit the next token selection to the K most probable tokens.  Default: `40`
 

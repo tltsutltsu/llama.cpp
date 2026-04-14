@@ -182,8 +182,37 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
+void common_sampler_sanitize_temp_schedule(common_params_sampling & params) {
+    if (params.temp_schedule.empty()) {
+        return;
+    }
+
+    // If mirostat is active, schedule is ignored — clear it
+    if (params.mirostat != 0) {
+        LOG_WRN("%s: temp_schedule is incompatible with mirostat, clearing schedule\n", __func__);
+        params.temp_schedule.clear();
+        return;
+    }
+
+    // If TEMPERATURE is not in the sampler sequence, schedule has no effect — clear it
+    bool has_temp = false;
+    for (const auto & s : params.samplers) {
+        if (s == COMMON_SAMPLER_TYPE_TEMPERATURE) {
+            has_temp = true;
+            break;
+        }
+    }
+    if (!has_temp) {
+        LOG_WRN("%s: temp_schedule set but TEMPERATURE not in sampler sequence, clearing schedule\n", __func__);
+        params.temp_schedule.clear();
+    }
+}
+
 struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    // Sanitize temp_schedule before building the chain
+    common_sampler_sanitize_temp_schedule(params);
 
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
@@ -337,7 +366,20 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
                     samplers.push_back(llama_sampler_init_typical(params.typ_p, params.min_keep));
                     break;
                 case COMMON_SAMPLER_TYPE_TEMPERATURE:
-                    samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
+                    if (!params.temp_schedule.empty()) {
+                        std::vector<float> pts;
+                        pts.reserve(params.temp_schedule.size() * 2);
+                        for (const auto & cp : params.temp_schedule) {
+                            pts.push_back(cp.first);
+                            pts.push_back(cp.second);
+                        }
+                        samplers.push_back(llama_sampler_init_temp_schedule(
+                            pts.data(), (int32_t)params.temp_schedule.size(),
+                            params.temp_schedule_interp,
+                            /*normalized=*/false, /*n_predict=*/0));
+                    } else {
+                        samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
+                    }
                     break;
                 case COMMON_SAMPLER_TYPE_INFILL:
                     samplers.push_back(llama_sampler_init_infill(vocab));

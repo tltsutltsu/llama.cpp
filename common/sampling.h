@@ -112,6 +112,9 @@ std::vector<enum common_sampler_type> common_sampler_types_from_chars(const std:
 llama_sampler * llama_sampler_init_llg(const llama_vocab * vocab,
                 const char * grammar_kind, const char * grammar_data);
 
+// Sanitize temp_schedule: clear if TEMPERATURE is not in the sampler sequence or mirostat is active.
+void common_sampler_sanitize_temp_schedule(common_params_sampling & params);
+
 struct common_sampler_deleter {
     void operator()(common_sampler * s) { common_sampler_free(s); }
 };

@@ -288,6 +288,11 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        // Propagate post-model-load sampling defaults back to the params used by routes.
+        // Model metadata may have changed mirostat, sampler sequence, etc., which affects
+        // temp_schedule sanitization and other sampling param defaults for requests.
+        params.sampling = ctx_server.get_sampling_defaults();
+
         routes.update_meta(ctx_server);
         ctx_http.is_ready.store(true);
 

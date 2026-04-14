@@ -658,6 +658,9 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
+        // Sanitize temp_schedule in server defaults after model metadata may have altered sampling params
+        common_sampler_sanitize_temp_schedule(params_base.sampling);
+
         if (params_base.speculative.has_dft()) {
             SRV_INF("loading draft model '%s'\n", params_base.speculative.mparams_dft.path.c_str());
 
@@ -3067,6 +3070,10 @@ struct server_res_generator : server_http_res {
         data = safe_json_to_str({{ "error", error_data }});
     }
 };
+
+common_params_sampling server_context::get_sampling_defaults() const {
+    return impl->params_base.sampling;
+}
 
 void server_context::on_sleeping_changed(std::function<void(bool)> callback) {
     impl->queue_tasks.on_sleeping_state(std::move(callback));

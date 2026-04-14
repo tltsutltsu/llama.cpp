@@ -78,6 +78,10 @@ struct server_context {
     // not thread-safe, should only be used from the main thread
     server_context_meta get_meta() const;
 
+    // get the sampling defaults after model load (may differ from startup params due to model metadata)
+    // not thread-safe, should only be used from the main thread after load_model()
+    common_params_sampling get_sampling_defaults() const;
+
     // register a callback to be called when sleeping state changes
     // must be set before load_model() is called
     void on_sleeping_changed(std::function<void(bool)> callback);

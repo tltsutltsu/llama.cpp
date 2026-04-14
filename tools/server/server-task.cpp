@@ -37,8 +37,25 @@ json task_params::to_json(bool only_metrics) const {
         lora.push_back({{"id", it.first}, {"scale", it.second}});
     }
 
+    auto temp_schedule_to_json = [](const std::vector<std::pair<float, float>> & schedule) {
+        json arr = json::array();
+        for (const auto & cp : schedule) {
+            arr.push_back(json::array({cp.first, cp.second}));
+        }
+        return arr;
+    };
+
+    auto temp_interp_to_str = [](llama_temp_schedule_interp interp) -> std::string {
+        switch (interp) {
+            case LLAMA_TEMP_SCHEDULE_INTERP_STEP:   return "step";
+            case LLAMA_TEMP_SCHEDULE_INTERP_LINEAR: return "linear";
+            case LLAMA_TEMP_SCHEDULE_INTERP_CUBIC:  return "cubic";
+            default:                                return "linear";
+        }
+    };
+
     if (only_metrics) {
-        return json {
+        json result = {
             {"seed",                      sampling.seed},
             {"temperature",               sampling.temp},
             {"dynatemp_range",            sampling.dynatemp_range},
@@ -86,6 +103,11 @@ json task_params::to_json(bool only_metrics) const {
             {"backend_sampling",          sampling.backend_sampling},
             {"lora",                      lora},
         };
+        if (!sampling.temp_schedule.empty()) {
+            result["temperature_schedule"]      = temp_schedule_to_json(sampling.temp_schedule);
+            result["temperature_interpolation"] = temp_interp_to_str(sampling.temp_schedule_interp);
+        }
+        return result;
     }
 
     auto grammar_triggers = json::array();
@@ -94,7 +116,7 @@ json task_params::to_json(bool only_metrics) const {
         grammar_triggers.push_back(ct.to_json());
     }
 
-    return json {
+    json result = {
         {"seed",                      sampling.seed},
         {"temperature",               sampling.temp},
         {"dynatemp_range",            sampling.dynatemp_range},
@@ -149,6 +171,11 @@ json task_params::to_json(bool only_metrics) const {
         {"backend_sampling",          sampling.backend_sampling},
         {"lora",                      lora},
     };
+    if (!sampling.temp_schedule.empty()) {
+        result["temperature_schedule"]      = temp_schedule_to_json(sampling.temp_schedule);
+        result["temperature_interpolation"] = temp_interp_to_str(sampling.temp_schedule_interp);
+    }
+    return result;
 }
 
 //
@@ -284,6 +311,67 @@ task_params server_task::params_from_json_cmpl(
     params.sampling.temp               = json_value(data, "temperature",         defaults.sampling.temp);
     params.sampling.dynatemp_range     = json_value(data, "dynatemp_range",      defaults.sampling.dynatemp_range);
     params.sampling.dynatemp_exponent  = json_value(data, "dynatemp_exponent",   defaults.sampling.dynatemp_exponent);
+
+    // temperature schedule
+    if (data.contains("temperature_schedule")) {
+        params.sampling.temp_schedule.clear();
+        const auto & sched = data.at("temperature_schedule");
+        if (sched.is_array()) {
+            for (const auto & pt : sched) {
+                if (pt.is_array() && pt.size() == 2) {
+                    params.sampling.temp_schedule.emplace_back(pt[0].get<float>(), pt[1].get<float>());
+                }
+            }
+        }
+
+        // Resolve normalization at parse time — source-local rule.
+        // Only normalize if points were actually parsed (empty schedule = no-op, no error).
+        if (!params.sampling.temp_schedule.empty() &&
+            data.contains("temperature_schedule_normalized") &&
+            data.at("temperature_schedule_normalized").get<bool>()) {
+            int32_t effective_n_predict = params.n_predict;
+            if (effective_n_predict <= 0) {
+                throw std::runtime_error("Error: temperature_schedule_normalized requires n_predict > 0");
+            }
+            float scale = (float)(effective_n_predict - 1);
+            if (effective_n_predict == 1) { scale = 0.0f; }
+            for (auto & cp : params.sampling.temp_schedule) {
+                cp.first *= scale;
+            }
+        }
+
+        // Warn if temperature or dynatemp_range also set
+        if (data.contains("temperature") && !params.sampling.temp_schedule.empty()) {
+            SRV_WRN("%s\n", "temperature_schedule overrides temperature");
+        }
+        if (data.contains("dynatemp_range") && !params.sampling.temp_schedule.empty()) {
+            SRV_WRN("%s\n", "temperature_schedule overrides dynatemp_range");
+        }
+    } else {
+        // Inherit schedule from server defaults
+        params.sampling.temp_schedule = defaults.sampling.temp_schedule;
+
+        // If request sends only temperature_schedule_normalized without temperature_schedule,
+        // ignore the flag (do not reinterpret inherited absolute schedule)
+    }
+
+    // Parse interpolation mode independently — a request can override just the interp mode
+    // even when inheriting the schedule from server defaults
+    if (data.contains("temperature_interpolation")) {
+        std::string interp_str = data.at("temperature_interpolation").get<std::string>();
+        if (interp_str == "step") {
+            params.sampling.temp_schedule_interp = LLAMA_TEMP_SCHEDULE_INTERP_STEP;
+        } else if (interp_str == "linear") {
+            params.sampling.temp_schedule_interp = LLAMA_TEMP_SCHEDULE_INTERP_LINEAR;
+        } else if (interp_str == "cubic") {
+            params.sampling.temp_schedule_interp = LLAMA_TEMP_SCHEDULE_INTERP_CUBIC;
+        } else {
+            throw std::runtime_error("Error: invalid temperature_interpolation value: " + interp_str + " (must be step, linear, or cubic)");
+        }
+    } else {
+        params.sampling.temp_schedule_interp = defaults.sampling.temp_schedule_interp;
+    }
+
     params.sampling.penalty_last_n     = json_value(data, "repeat_last_n",       defaults.sampling.penalty_last_n);
     params.sampling.penalty_repeat     = json_value(data, "repeat_penalty",      defaults.sampling.penalty_repeat);
     params.sampling.penalty_freq       = json_value(data, "frequency_penalty",   defaults.sampling.penalty_freq);
@@ -602,6 +690,11 @@ task_params server_task::params_from_json_cmpl(
     if (params.n_cmpl > params_base.n_parallel) {
         throw std::runtime_error("n_cmpl cannot be greater than the number of slots, please increase -np");
     }
+
+    // Sanitize temp_schedule: clear if mirostat is active or TEMPERATURE not in sampler sequence.
+    // This catches stale schedules inherited from server defaults when model metadata changes
+    // the sampler sequence or enables mirostat after startup.
+    common_sampler_sanitize_temp_schedule(params.sampling);
 
     return params;
 }

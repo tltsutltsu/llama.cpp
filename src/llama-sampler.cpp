@@ -286,6 +286,119 @@ static void llama_sampler_temp_impl(llama_token_data_array * cur_p, float temp) 
     }
 }
 
+// temperature schedule interpolation helpers
+// All take a sorted vector of (position, temperature) control points and a position.
+
+static float temp_schedule_step(const std::vector<std::pair<float, float>> & points, float pos) {
+    // Return temp of last control point with pos <= current. Before first point → first point's temp.
+    if (points.empty()) { return 1.0f; }
+    if (pos <= points.front().first) { return points.front().second; }
+    if (pos >= points.back().first)  { return points.back().second; }
+    // binary search for last point with position <= pos
+    auto it = std::upper_bound(points.begin(), points.end(), pos,
+        [](float p, const std::pair<float, float> & cp) { return p < cp.first; });
+    --it; // it now points to last element with position <= pos
+    return it->second;
+}
+
+static float temp_schedule_linear(const std::vector<std::pair<float, float>> & points, float pos) {
+    if (points.empty()) { return 1.0f; }
+    if (pos <= points.front().first) { return points.front().second; }
+    if (pos >= points.back().first)  { return points.back().second; }
+    // binary search for segment
+    auto it = std::upper_bound(points.begin(), points.end(), pos,
+        [](float p, const std::pair<float, float> & cp) { return p < cp.first; });
+    auto p1 = it;
+    auto p0 = it - 1;
+    float t = (pos - p0->first) / (p1->first - p0->first);
+    return p0->second + t * (p1->second - p0->second);
+}
+
+static float temp_schedule_cubic(const std::vector<std::pair<float, float>> & points, float pos) {
+    // Catmull-Rom spline with chordal parameterization. Phantom endpoints at boundaries.
+    if (points.empty()) { return 1.0f; }
+    if (pos <= points.front().first) { return points.front().second; }
+    if (pos >= points.back().first)  { return points.back().second; }
+    // find segment
+    auto it = std::upper_bound(points.begin(), points.end(), pos,
+        [](float p, const std::pair<float, float> & cp) { return p < cp.first; });
+    size_t i1 = (size_t)(it - points.begin());
+    size_t i0 = i1 - 1;
+    size_t n  = points.size();
+
+    float x0 = points[i0].first,  y0 = points[i0].second;
+    float x1 = points[i1].first,  y1 = points[i1].second;
+    float dx = x1 - x0;
+    float t  = (pos - x0) / dx;
+
+    // Chord length between two 2D control points
+    auto chord = [](float xa, float ya, float xb, float yb) -> float {
+        float cx = xb - xa, cy = yb - ya;
+        return sqrtf(cx*cx + cy*cy);
+    };
+
+    // Compute chordal Catmull-Rom tangent slope (dy/dx) at point (xc, yc)
+    // given its two neighbors (xm, ym) and (xp, yp).
+    //
+    // Non-uniform Catmull-Rom tangent with chord-length parameterization:
+    //   v_k = (P_k - P_{k-1})/d_prev * d_next/(d_prev+d_next)
+    //       + (P_{k+1} - P_k)/d_next * d_prev/(d_prev+d_next)
+    // This gives a 2D velocity vector; slope = v_y / v_x.
+    auto chordal_slope = [&chord](
+            float xm, float ym, float xc, float yc, float xp, float yp) -> float {
+        float d_prev = chord(xm, ym, xc, yc);
+        float d_next = chord(xc, yc, xp, yp);
+        float d_sum  = d_prev + d_next;
+        if (d_prev < 1e-10f || d_next < 1e-10f || d_sum < 1e-10f) {
+            float total_dx = xp - xm;
+            return (std::fabs(total_dx) > 1e-10f) ? (yp - ym) / total_dx : 0.0f;
+        }
+        float w_next = d_next / d_sum;
+        float w_prev = d_prev / d_sum;
+        float vx = (xc - xm) / d_prev * w_next + (xp - xc) / d_next * w_prev;
+        float vy = (yc - ym) / d_prev * w_next + (yp - yc) / d_next * w_prev;
+        return (std::fabs(vx) > 1e-10f) ? vy / vx : 0.0f;
+    };
+
+    // Compute tangent slopes at segment endpoints
+    float slope0, slope1;
+    if (i0 == 0) {
+        // phantom: tangent = segment slope
+        slope0 = (y1 - y0) / dx;
+    } else {
+        slope0 = chordal_slope(
+            points[i0 - 1].first, points[i0 - 1].second,
+            x0, y0, x1, y1);
+    }
+    if (i1 == n - 1) {
+        // phantom: tangent = segment slope
+        slope1 = (y1 - y0) / dx;
+    } else {
+        slope1 = chordal_slope(
+            x0, y0, x1, y1,
+            points[i1 + 1].first, points[i1 + 1].second);
+    }
+
+    // Convert slopes to Hermite tangent magnitudes (scale by segment length)
+    float m0 = slope0 * dx;
+    float m1 = slope1 * dx;
+
+    // Hermite basis
+    float t2 = t * t;
+    float t3 = t2 * t;
+    float h00 =  2*t3 - 3*t2 + 1;
+    float h10 =    t3 - 2*t2 + t;
+    float h01 = -2*t3 + 3*t2;
+    float h11 =    t3 -   t2;
+
+    float result = h00*y0 + h10*m0 + h01*y1 + h11*m1;
+
+    // Clamp negative overshoot to 0.0 (greedy), cap at 1e6
+    if (result < 0.0f) { result = 0.0f; }
+    if (result > 1e6f) { result = 1e6f; }
+    return result;
+}
+
 static void llama_sampler_softmax_impl(llama_token_data_array * cur_p, bool do_sort) {
     GGML_ASSERT(cur_p->size > 0);
 
@@ -2096,6 +2209,151 @@ struct llama_sampler * llama_sampler_init_temp_ext(float temp, float delta, floa
     );
 
     return res;
+}
+
+// temp-schedule
+
+struct llama_sampler_temp_schedule : public llama_sampler_backend {
+    std::vector<std::pair<float, float>> points; // sorted by position (already resolved to absolute)
+    llama_temp_schedule_interp             interp;
+    int32_t                                pos;     // current generation-relative position
+    bool                                   applied; // true after apply(), cleared by accept()
+};
+
+static const char * llama_sampler_temp_schedule_name(const struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_temp_schedule *) smpl->ctx;
+    return ctx->get_name();
+}
+
+static void llama_sampler_temp_schedule_accept(struct llama_sampler * smpl, llama_token /*token*/) {
+    auto * ctx = (llama_sampler_temp_schedule *) smpl->ctx;
+    if (ctx->applied) {
+        ctx->pos++;
+        ctx->applied = false;
+    }
+    // If !applied (prompt pre-feeding), no-op — position stays the same.
+}
+
+static void llama_sampler_temp_schedule_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * ctx = (llama_sampler_temp_schedule *) smpl->ctx;
+
+    float temp = 1.0f;
+    float fpos = (float)ctx->pos;
+    switch (ctx->interp) {
+        case LLAMA_TEMP_SCHEDULE_INTERP_STEP:   temp = temp_schedule_step  (ctx->points, fpos); break;
+        case LLAMA_TEMP_SCHEDULE_INTERP_LINEAR: temp = temp_schedule_linear(ctx->points, fpos); break;
+        case LLAMA_TEMP_SCHEDULE_INTERP_CUBIC:  temp = temp_schedule_cubic (ctx->points, fpos); break;
+    }
+
+    llama_sampler_temp_impl(cur_p, temp);
+    ctx->applied = true;
+}
+
+static void llama_sampler_temp_schedule_reset(struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_temp_schedule *) smpl->ctx;
+    ctx->pos = 0;
+    ctx->applied = false;
+}
+
+static struct llama_sampler * llama_sampler_temp_schedule_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const llama_sampler_temp_schedule *) smpl->ctx;
+    return llama_sampler_init(
+        smpl->iface,
+        new llama_sampler_temp_schedule {
+            ("temp-schedule"),
+            /* .points  = */ ctx->points,
+            /* .interp  = */ ctx->interp,
+            /* .pos     = */ ctx->pos,
+            /* .applied = */ ctx->applied,
+        }
+    );
+}
+
+static void llama_sampler_temp_schedule_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_temp_schedule *) smpl->ctx;
+}
+
+static struct llama_sampler_i llama_sampler_temp_schedule_i = {
+    /* .name              = */ llama_sampler_temp_schedule_name,
+    /* .accept            = */ llama_sampler_temp_schedule_accept,
+    /* .apply             = */ llama_sampler_temp_schedule_apply,
+    /* .reset             = */ llama_sampler_temp_schedule_reset,
+    /* .clone             = */ llama_sampler_temp_schedule_clone,
+    /* .free              = */ llama_sampler_temp_schedule_free,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+};
+
+struct llama_sampler * llama_sampler_init_temp_schedule(
+        const float * points,
+        int32_t       n_points,
+        enum llama_temp_schedule_interp interp,
+        bool          normalized,
+        int32_t       n_predict) {
+    if (n_points <= 0 || points == nullptr) {
+        return llama_sampler_init_empty("?temp-schedule");
+    }
+
+    // Convert interleaved floats to pairs, skipping non-finite values
+    std::vector<std::pair<float, float>> pts;
+    pts.reserve((size_t)n_points);
+    for (int32_t i = 0; i < n_points; i++) {
+        float p = points[i * 2];
+        float t = points[i * 2 + 1];
+        if (!std::isfinite(p) || !std::isfinite(t)) {
+            continue;
+        }
+        pts.emplace_back(p, t);
+    }
+
+    // Resolve normalized positions
+    if (normalized) {
+        if (n_predict <= 0) {
+            LLAMA_LOG_WARN("%s: normalized temp schedule requires n_predict > 0, returning no-op\n", __func__);
+            return llama_sampler_init_empty("?temp-schedule");
+        }
+        float scale = (float)(n_predict - 1);
+        if (n_predict == 1) { scale = 0.0f; }
+        for (auto & cp : pts) {
+            cp.first *= scale;
+        }
+    }
+
+    // Sort by position ascending (stable to preserve input order for equal positions — "last wins" dedup)
+    std::stable_sort(pts.begin(), pts.end(), [](const std::pair<float, float> & a, const std::pair<float, float> & b) {
+        return a.first < b.first;
+    });
+
+    // Deduplicate: consecutive points with same position (within epsilon) → keep last
+    {
+        const float eps = 1e-6f;
+        std::vector<std::pair<float, float>> deduped;
+        deduped.reserve(pts.size());
+        for (size_t i = 0; i < pts.size(); i++) {
+            if (i + 1 < pts.size() && std::fabs(pts[i].first - pts[i + 1].first) < eps) {
+                continue; // skip, keep the later one
+            }
+            deduped.push_back(pts[i]);
+        }
+        pts = std::move(deduped);
+    }
+
+    if (pts.empty()) {
+        return llama_sampler_init_empty("?temp-schedule");
+    }
+
+    return llama_sampler_init(
+        /* .iface = */ &llama_sampler_temp_schedule_i,
+        /* .ctx   = */ new llama_sampler_temp_schedule {
+            ("temp-schedule"),
+            /* .points  = */ std::move(pts),
+            /* .interp  = */ interp,
+            /* .pos     = */ 0,
+            /* .applied = */ false,
+        }
+    );
 }
 
 // xtc

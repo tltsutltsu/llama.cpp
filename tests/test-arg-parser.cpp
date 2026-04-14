@@ -1,6 +1,9 @@
 #include "arg.h"
 #include "common.h"
 #include "download.h"
+#include "sampling.h"
+
+#include <cmath>
 
 #include <string>
 #include <vector>
@@ -202,6 +205,48 @@ int main(void) {
         } catch (std::exception & e) {
             printf("  expected error: %s\n\n", e.what());
         }
+    }
+
+    // test --temp-schedule-normalized with --n-predict
+    printf("test-arg-parser: test --temp-schedule-normalized parsing\n\n");
+    argv = {"binary_name", "--temp-schedule-normalized", "0.0:1.0,1.0:0.5", "--predict", "100"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.sampling.temp_schedule.size() == 2);
+    assert(fabs(params.sampling.temp_schedule[0].first - 0.0f) < 0.01f);
+    assert(fabs(params.sampling.temp_schedule[0].second - 1.0f) < 0.01f);
+    assert(fabs(params.sampling.temp_schedule[1].first - 99.0f) < 0.01f);  // 1.0 * (100-1) = 99
+    assert(fabs(params.sampling.temp_schedule[1].second - 0.5f) < 0.01f);
+
+    // test --temp-schedule absolute positions
+    printf("test-arg-parser: test --temp-schedule absolute parsing\n\n");
+    argv = {"binary_name", "--temp-schedule", "0:1.0,100:0.5"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.sampling.temp_schedule.size() == 2);
+    assert(fabs(params.sampling.temp_schedule[0].first - 0.0f) < 0.01f);
+    assert(fabs(params.sampling.temp_schedule[0].second - 1.0f) < 0.01f);
+    assert(fabs(params.sampling.temp_schedule[1].first - 100.0f) < 0.01f);
+    assert(fabs(params.sampling.temp_schedule[1].second - 0.5f) < 0.01f);
+
+    // test --temp-schedule-normalized without --n-predict should fail
+    printf("test-arg-parser: test --temp-schedule-normalized without --n-predict\n\n");
+    {
+        common_params fresh_params;
+        argv = {"binary_name", "--temp-schedule-normalized", "0.0:1.0,1.0:0.5"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fresh_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    // test schedule sanitization: temp_schedule with TEMPERATURE absent from samplers
+    printf("test-arg-parser: test schedule sanitization\n\n");
+    {
+        common_params_sampling sparams;
+        sparams.temp_schedule = {{0.0f, 1.0f}, {100.0f, 0.5f}};
+        sparams.samplers = {
+            COMMON_SAMPLER_TYPE_TOP_K,
+            COMMON_SAMPLER_TYPE_TOP_P,
+            // TEMPERATURE intentionally omitted
+        };
+        common_sampler_sanitize_temp_schedule(sparams);
+        assert(sparams.temp_schedule.empty());
     }
 
     printf("test-arg-parser: all tests OK\n\n");
