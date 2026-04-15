@@ -10,6 +10,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
@@ -166,20 +167,132 @@ struct common_sampler {
     mutable int64_t t_total_us = 0;
 };
 
+// Local copy of the prepare-points pipeline used by llama_sampler_init_min_p_schedule. The
+// llama side exports llama_min_p_schedule_prepare_points from src/llama-sampler.cpp, but common/
+// does not link against llama internals — so we maintain a parallel implementation here and pin
+// the two together with a parity test in tests/test-sampling.cpp.
+static std::vector<std::pair<float, float>> min_p_schedule_prepare_points_common(
+        const std::vector<std::pair<float, float>> & raw,
+        bool    normalized,
+        int32_t n_predict) {
+    std::vector<std::pair<float, float>> pts;
+    pts.reserve(raw.size());
+    for (const auto & cp : raw) {
+        if (!std::isfinite(cp.first) || !std::isfinite(cp.second)) {
+            continue;
+        }
+        pts.emplace_back(cp.first, cp.second);
+    }
+
+    if (normalized) {
+        if (n_predict <= 0) {
+            return {};
+        }
+        float scale = (float)(n_predict - 1);
+        if (n_predict == 1) { scale = 0.0f; }
+        for (auto & cp : pts) {
+            cp.first *= scale;
+        }
+    }
+
+    std::stable_sort(pts.begin(), pts.end(), [](const std::pair<float, float> & a, const std::pair<float, float> & b) {
+        return a.first < b.first;
+    });
+
+    {
+        const float eps = 1e-6f;
+        std::vector<std::pair<float, float>> deduped;
+        deduped.reserve(pts.size());
+        for (size_t i = 0; i < pts.size(); i++) {
+            if (i + 1 < pts.size() && std::fabs(pts[i].first - pts[i + 1].first) < eps) {
+                continue;
+            }
+            deduped.push_back(pts[i]);
+        }
+        pts = std::move(deduped);
+    }
+
+    return pts;
+}
+
+std::vector<std::pair<float, float>> common_sampler_resolve_min_p_schedule_positions(
+        const std::vector<std::pair<float, float>> & points,
+        bool    needs_normalization,
+        int32_t n_predict) {
+    return min_p_schedule_prepare_points_common(points, needs_normalization, n_predict);
+}
+
+static const char * min_p_schedule_interp_to_str(llama_min_p_schedule_interp interp) {
+    switch (interp) {
+        case LLAMA_MIN_P_SCHEDULE_INTERP_STEP:   return "step";
+        case LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR: return "linear";
+        case LLAMA_MIN_P_SCHEDULE_INTERP_CUBIC:  return "cubic";
+    }
+    return "linear";
+}
+
+static const char * temp_schedule_interp_to_str(llama_temp_schedule_interp interp) {
+    switch (interp) {
+        case LLAMA_TEMP_SCHEDULE_INTERP_STEP:   return "step";
+        case LLAMA_TEMP_SCHEDULE_INTERP_LINEAR: return "linear";
+        case LLAMA_TEMP_SCHEDULE_INTERP_CUBIC:  return "cubic";
+    }
+    return "linear";
+}
+
 std::string common_params_sampling::print() const {
-    char result[1024];
+    // Dynamic string: a schedule of just 10 control points blows past the old 1024-byte buffer.
+    std::ostringstream out;
+    char line[512];
 
-    snprintf(result, sizeof(result),
-            "\trepeat_last_n = %d, repeat_penalty = %.3f, frequency_penalty = %.3f, presence_penalty = %.3f\n"
-            "\tdry_multiplier = %.3f, dry_base = %.3f, dry_allowed_length = %d, dry_penalty_last_n = %d\n"
-            "\ttop_k = %d, top_p = %.3f, min_p = %.3f, xtc_probability = %.3f, xtc_threshold = %.3f, typical_p = %.3f, top_n_sigma = %.3f, temp = %.3f\n"
+    snprintf(line, sizeof(line),
+            "\trepeat_last_n = %d, repeat_penalty = %.3f, frequency_penalty = %.3f, presence_penalty = %.3f\n",
+            penalty_last_n, penalty_repeat, penalty_freq, penalty_present);
+    out << line;
+
+    snprintf(line, sizeof(line),
+            "\tdry_multiplier = %.3f, dry_base = %.3f, dry_allowed_length = %d, dry_penalty_last_n = %d\n",
+            dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n);
+    out << line;
+
+    snprintf(line, sizeof(line),
+            "\ttop_k = %d, top_p = %.3f, min_p = %.3f, xtc_probability = %.3f, xtc_threshold = %.3f, typical_p = %.3f, top_n_sigma = %.3f, temp = %.3f\n",
+            top_k, top_p, min_p, xtc_probability, xtc_threshold, typ_p, top_n_sigma, temp);
+    out << line;
+
+    snprintf(line, sizeof(line),
             "\tmirostat = %d, mirostat_lr = %.3f, mirostat_ent = %.3f, adaptive_target = %.3f, adaptive_decay = %.3f",
-            penalty_last_n, penalty_repeat, penalty_freq, penalty_present,
-            dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n,
-            top_k, top_p, min_p, xtc_probability, xtc_threshold, typ_p, top_n_sigma, temp,
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
+    out << line;
 
-    return std::string(result);
+    // Asymmetric formats. temp_schedule is already stored as resolved absolute points (temp commit
+    // consumed needs_normalization at parse time and does not cache n_predict). min_p_schedule
+    // stores raw points + the normalization flag + cached n_predict, so we can display all four.
+    if (!temp_schedule.empty()) {
+        out << "\n\ttemp_schedule = (";
+        for (size_t i = 0; i < temp_schedule.size(); i++) {
+            if (i > 0) { out << ", "; }
+            snprintf(line, sizeof(line), "%.3f:%.3f", temp_schedule[i].first, temp_schedule[i].second);
+            out << line;
+        }
+        out << ") interp=" << temp_schedule_interp_to_str(temp_schedule_interp);
+    }
+
+    if (!min_p_schedule.empty()) {
+        auto resolved = common_sampler_resolve_min_p_schedule_positions(
+            min_p_schedule, min_p_schedule_needs_normalization, min_p_schedule_n_predict);
+        out << "\n\tmin_p_schedule = (";
+        for (size_t i = 0; i < resolved.size(); i++) {
+            if (i > 0) { out << ", "; }
+            snprintf(line, sizeof(line), "%.3f:%.3f", resolved[i].first, resolved[i].second);
+            out << line;
+        }
+        out << ") interp="        << min_p_schedule_interp_to_str(min_p_schedule_interp)
+            << " normalized="     << (min_p_schedule_needs_normalization ? "true" : "false")
+            << " n_predict="      << min_p_schedule_n_predict;
+    }
+
+    return out.str();
 }
 
 void common_sampler_sanitize_temp_schedule(common_params_sampling & params) {
@@ -208,11 +321,42 @@ void common_sampler_sanitize_temp_schedule(common_params_sampling & params) {
     }
 }
 
+void common_sampler_clear_min_p_schedule(common_params_sampling & params) {
+    params.min_p_schedule.clear();
+    params.min_p_schedule_needs_normalization = false;
+    params.min_p_schedule_n_predict           = 0;
+}
+
+void common_sampler_sanitize_min_p_schedule(common_params_sampling & params) {
+    if (params.min_p_schedule.empty()) {
+        return;
+    }
+
+    if (params.mirostat != 0) {
+        LOG_WRN("%s: min_p_schedule is incompatible with mirostat, clearing schedule\n", __func__);
+        common_sampler_clear_min_p_schedule(params);
+        return;
+    }
+
+    bool has_min_p = false;
+    for (const auto & s : params.samplers) {
+        if (s == COMMON_SAMPLER_TYPE_MIN_P) {
+            has_min_p = true;
+            break;
+        }
+    }
+    if (!has_min_p) {
+        LOG_WRN("%s: min_p_schedule set but MIN_P not in sampler sequence, clearing schedule\n", __func__);
+        common_sampler_clear_min_p_schedule(params);
+    }
+}
+
 struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    // Sanitize temp_schedule before building the chain
+    // Sanitize schedules before building the chain
     common_sampler_sanitize_temp_schedule(params);
+    common_sampler_sanitize_min_p_schedule(params);
 
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
@@ -357,7 +501,22 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
                     samplers.push_back(llama_sampler_init_top_n_sigma(params.top_n_sigma));
                     break;
                 case COMMON_SAMPLER_TYPE_MIN_P:
-                    samplers.push_back(llama_sampler_init_min_p(params.min_p, params.min_keep));
+                    if (!params.min_p_schedule.empty()) {
+                        std::vector<float> pts;
+                        pts.reserve(params.min_p_schedule.size() * 2);
+                        for (const auto & cp : params.min_p_schedule) {
+                            pts.push_back(cp.first);
+                            pts.push_back(cp.second);
+                        }
+                        samplers.push_back(llama_sampler_init_min_p_schedule(
+                            pts.data(), (int32_t)params.min_p_schedule.size(),
+                            params.min_p_schedule_interp,
+                            params.min_p_schedule_needs_normalization,
+                            params.min_p_schedule_n_predict,
+                            params.min_keep));
+                    } else {
+                        samplers.push_back(llama_sampler_init_min_p(params.min_p, params.min_keep));
+                    }
                     break;
                 case COMMON_SAMPLER_TYPE_XTC:
                     samplers.push_back(llama_sampler_init_xtc(params.xtc_probability, params.xtc_threshold, params.min_keep, params.seed));

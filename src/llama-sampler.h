@@ -40,3 +40,12 @@ struct llama_sampler * llama_sampler_init_dry_testing(
         int32_t dry_allowed_length,
         int32_t dry_penalty_last_n,
         const std::vector<std::vector<llama_token>> & seq_breakers);
+
+// Transform a raw min-p schedule point list the same way llama_sampler_init_min_p_schedule does:
+// filter non-finite, optionally normalize (multiply positions by n_predict - 1), stable sort by
+// position, and epsilon dedupe with "last wins". Externally linkable so tests can compare this
+// against the common-side twin. Not LLAMA_API — internal symbol.
+std::vector<std::pair<float, float>> llama_min_p_schedule_prepare_points(
+        const std::vector<std::pair<float, float>> & raw,
+        bool    normalized,
+        int32_t n_predict);

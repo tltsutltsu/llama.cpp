@@ -594,6 +594,27 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     }
 
+    // Post-parse handling for min-p schedule (D1: single normalization owner is the sampler ctor).
+    // Cache n_predict, run the sanitizer, then validate on the post-sanitize state.
+    params.sampling.min_p_schedule_n_predict = params.n_predict;
+    common_sampler_sanitize_min_p_schedule(params.sampling);
+    if (!params.sampling.min_p_schedule.empty()
+        && params.sampling.min_p_schedule_needs_normalization
+        && params.sampling.min_p_schedule_n_predict <= 0) {
+        throw std::invalid_argument(
+            "error: --min-p-schedule-normalized requires --n-predict > 0; "
+            "note that this check runs before model metadata is applied, so a model that would "
+            "remove MIN_P from the sampler sequence does not suppress this error — use "
+            "--min-p-schedule with absolute positions instead, or pass a valid --n-predict.\n");
+    }
+
+    // Warn if min_p_schedule overrides --min-p
+    if (!params.sampling.min_p_schedule.empty()) {
+        if (params.sampling.user_sampling_config & common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P) {
+            LOG_WRN("%s: --min-p-schedule overrides --min-p\n", __func__);
+        }
+    }
+
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
@@ -1866,6 +1887,60 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.sampling.temp_schedule_interp = LLAMA_TEMP_SCHEDULE_INTERP_CUBIC;
             } else {
                 throw std::invalid_argument("invalid temp-schedule-interp value: " + value);
+            }
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--min-p-schedule"}, "SCHEDULE",
+        "min-p schedule as pos0:p0,pos1:p1,... (absolute token positions)",
+        [](common_params & params, const std::string & value) {
+            common_sampler_clear_min_p_schedule(params.sampling);
+            std::istringstream ss(value);
+            std::string pair_str;
+            while (std::getline(ss, pair_str, ',')) {
+                auto colon = pair_str.find(':');
+                if (colon == std::string::npos) {
+                    throw std::invalid_argument("invalid min-p-schedule format, expected pos:p pairs");
+                }
+                float pos = std::stof(pair_str.substr(0, colon));
+                float p   = std::stof(pair_str.substr(colon + 1));
+                params.sampling.min_p_schedule.emplace_back(pos, p);
+            }
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P_SCHEDULE;
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--min-p-schedule-normalized"}, "SCHEDULE",
+        "min-p schedule as frac0:p0,frac1:p1,... (positions are fractions of --n-predict)",
+        [](common_params & params, const std::string & value) {
+            common_sampler_clear_min_p_schedule(params.sampling);
+            params.sampling.min_p_schedule_needs_normalization = true;
+            std::istringstream ss(value);
+            std::string pair_str;
+            while (std::getline(ss, pair_str, ',')) {
+                auto colon = pair_str.find(':');
+                if (colon == std::string::npos) {
+                    throw std::invalid_argument("invalid min-p-schedule-normalized format, expected frac:p pairs");
+                }
+                float pos = std::stof(pair_str.substr(0, colon));
+                float p   = std::stof(pair_str.substr(colon + 1));
+                params.sampling.min_p_schedule.emplace_back(pos, p);
+            }
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P_SCHEDULE;
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--min-p-schedule-interp"}, "METHOD",
+        "min-p schedule interpolation method: step, linear, cubic (default: linear)",
+        [](common_params & params, const std::string & value) {
+            if (value == "step") {
+                params.sampling.min_p_schedule_interp = LLAMA_MIN_P_SCHEDULE_INTERP_STEP;
+            } else if (value == "linear") {
+                params.sampling.min_p_schedule_interp = LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR;
+            } else if (value == "cubic") {
+                params.sampling.min_p_schedule_interp = LLAMA_MIN_P_SCHEDULE_INTERP_CUBIC;
+            } else {
+                throw std::invalid_argument("invalid min-p-schedule-interp value: " + value);
             }
         }
     ).set_sparam());

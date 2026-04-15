@@ -399,6 +399,104 @@ static float temp_schedule_cubic(const std::vector<std::pair<float, float>> & po
     return result;
 }
 
+// min-p schedule interpolation helpers
+// All take a sorted vector of (position, min_p) control points and a position.
+// Values are clamped to [0, 1] — min-p is a probability threshold.
+
+static float min_p_schedule_step(const std::vector<std::pair<float, float>> & points, float pos) {
+    if (points.empty()) { return 0.0f; }
+    if (pos <= points.front().first) { return points.front().second; }
+    if (pos >= points.back().first)  { return points.back().second; }
+    auto it = std::upper_bound(points.begin(), points.end(), pos,
+        [](float p, const std::pair<float, float> & cp) { return p < cp.first; });
+    --it;
+    return it->second;
+}
+
+static float min_p_schedule_linear(const std::vector<std::pair<float, float>> & points, float pos) {
+    if (points.empty()) { return 0.0f; }
+    if (pos <= points.front().first) { return points.front().second; }
+    if (pos >= points.back().first)  { return points.back().second; }
+    auto it = std::upper_bound(points.begin(), points.end(), pos,
+        [](float p, const std::pair<float, float> & cp) { return p < cp.first; });
+    auto p1 = it;
+    auto p0 = it - 1;
+    float t = (pos - p0->first) / (p1->first - p0->first);
+    return p0->second + t * (p1->second - p0->second);
+}
+
+static float min_p_schedule_cubic(const std::vector<std::pair<float, float>> & points, float pos) {
+    // Catmull-Rom spline with chordal parameterization. Phantom endpoints at boundaries.
+    // Math body verbatim parallel to temp_schedule_cubic; only the final clamp differs ([0, 1] both ends).
+    if (points.empty()) { return 0.0f; }
+    if (pos <= points.front().first) { return points.front().second; }
+    if (pos >= points.back().first)  { return points.back().second; }
+    auto it = std::upper_bound(points.begin(), points.end(), pos,
+        [](float p, const std::pair<float, float> & cp) { return p < cp.first; });
+    size_t i1 = (size_t)(it - points.begin());
+    size_t i0 = i1 - 1;
+    size_t n  = points.size();
+
+    float x0 = points[i0].first,  y0 = points[i0].second;
+    float x1 = points[i1].first,  y1 = points[i1].second;
+    float dx = x1 - x0;
+    float t  = (pos - x0) / dx;
+
+    auto chord = [](float xa, float ya, float xb, float yb) -> float {
+        float cx = xb - xa, cy = yb - ya;
+        return sqrtf(cx*cx + cy*cy);
+    };
+
+    auto chordal_slope = [&chord](
+            float xm, float ym, float xc, float yc, float xp, float yp) -> float {
+        float d_prev = chord(xm, ym, xc, yc);
+        float d_next = chord(xc, yc, xp, yp);
+        float d_sum  = d_prev + d_next;
+        if (d_prev < 1e-10f || d_next < 1e-10f || d_sum < 1e-10f) {
+            float total_dx = xp - xm;
+            return (std::fabs(total_dx) > 1e-10f) ? (yp - ym) / total_dx : 0.0f;
+        }
+        float w_next = d_next / d_sum;
+        float w_prev = d_prev / d_sum;
+        float vx = (xc - xm) / d_prev * w_next + (xp - xc) / d_next * w_prev;
+        float vy = (yc - ym) / d_prev * w_next + (yp - yc) / d_next * w_prev;
+        return (std::fabs(vx) > 1e-10f) ? vy / vx : 0.0f;
+    };
+
+    float slope0, slope1;
+    if (i0 == 0) {
+        slope0 = (y1 - y0) / dx;
+    } else {
+        slope0 = chordal_slope(
+            points[i0 - 1].first, points[i0 - 1].second,
+            x0, y0, x1, y1);
+    }
+    if (i1 == n - 1) {
+        slope1 = (y1 - y0) / dx;
+    } else {
+        slope1 = chordal_slope(
+            x0, y0, x1, y1,
+            points[i1 + 1].first, points[i1 + 1].second);
+    }
+
+    float m0 = slope0 * dx;
+    float m1 = slope1 * dx;
+
+    float t2 = t * t;
+    float t3 = t2 * t;
+    float h00 =  2*t3 - 3*t2 + 1;
+    float h10 =    t3 - 2*t2 + t;
+    float h01 = -2*t3 + 3*t2;
+    float h11 =    t3 -   t2;
+
+    float result = h00*y0 + h10*m0 + h01*y1 + h11*m1;
+
+    // Clamp to [0, 1] — min-p is a probability threshold.
+    if (result < 0.0f) { result = 0.0f; }
+    if (result > 1.0f) { result = 1.0f; }
+    return result;
+}
+
 static void llama_sampler_softmax_impl(llama_token_data_array * cur_p, bool do_sort) {
     GGML_ASSERT(cur_p->size > 0);
 
@@ -1653,10 +1751,8 @@ static const char * llama_sampler_min_p_name(const struct llama_sampler * smpl) 
     return sctx->get_name();
 }
 
-static void llama_sampler_min_p_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
-    auto * ctx = (llama_sampler_min_p *) smpl->ctx;
-
-    if (ctx->p <= 0.0f || !cur_p->size) {
+static void llama_sampler_min_p_impl(llama_token_data_array * cur_p, float p, size_t min_keep) {
+    if (p <= 0.0f || !cur_p->size) {
         return;
     }
 
@@ -1670,7 +1766,7 @@ static void llama_sampler_min_p_apply(struct llama_sampler * smpl, llama_token_d
         for (size_t i = 0; i < cur_p->size; ++i) {
             max_logit = std::max(max_logit, cur_p->data[i].logit);
         }
-        const float min_logit = max_logit + logf(ctx->p); // min logit for p_i >= p * p_max
+        const float min_logit = max_logit + logf(p); // min logit for p_i >= p * p_max
 
         for (size_t i = 0; i < cur_p->size; ++i) {
             if (cur_p->data[i].logit >= min_logit) {
@@ -1679,7 +1775,7 @@ static void llama_sampler_min_p_apply(struct llama_sampler * smpl, llama_token_d
         }
 
         // if we have enough values the operation was a success
-        if (!filtered_tokens.empty() && filtered_tokens.size() >= ctx->min_keep) {
+        if (!filtered_tokens.empty() && filtered_tokens.size() >= min_keep) {
             std::copy(filtered_tokens.begin(), filtered_tokens.end(), cur_p->data);
             cur_p->size = filtered_tokens.size();
             min_p_applied = true;
@@ -1693,11 +1789,11 @@ static void llama_sampler_min_p_apply(struct llama_sampler * smpl, llama_token_d
             llama_token_data_array_partial_sort_inplace(cur_p, cur_p->size);
         }
 
-        const float min_logit = cur_p->data[0].logit + logf(ctx->p); // min logit for p_i >= p * p_max
+        const float min_logit = cur_p->data[0].logit + logf(p); // min logit for p_i >= p * p_max
         size_t i = 1; // first token always matches
 
         for (; i < cur_p->size; ++i) {
-            if (cur_p->data[i].logit < min_logit && i >= ctx->min_keep) {
+            if (cur_p->data[i].logit < min_logit && i >= min_keep) {
                 break; // prob too small
             }
         }
@@ -1705,6 +1801,11 @@ static void llama_sampler_min_p_apply(struct llama_sampler * smpl, llama_token_d
         // Resize the output vector to keep only the matching tokens
         cur_p->size = i;
     }
+}
+
+static void llama_sampler_min_p_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * ctx = (llama_sampler_min_p *) smpl->ctx;
+    llama_sampler_min_p_impl(cur_p, ctx->p, ctx->min_keep);
 }
 
 static struct llama_sampler * llama_sampler_min_p_clone(const struct llama_sampler * smpl) {
@@ -2352,6 +2453,168 @@ struct llama_sampler * llama_sampler_init_temp_schedule(
             /* .interp  = */ interp,
             /* .pos     = */ 0,
             /* .applied = */ false,
+        }
+    );
+}
+
+// min-p schedule
+
+struct llama_sampler_min_p_schedule : public llama_sampler_backend {
+    std::vector<std::pair<float, float>> points; // sorted by position (already resolved to absolute)
+    llama_min_p_schedule_interp            interp;
+    size_t                                 min_keep;
+    int32_t                                pos;     // current generation-relative position
+    bool                                   applied; // true after apply(), cleared by accept()
+};
+
+static const char * llama_sampler_min_p_schedule_name(const struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_min_p_schedule *) smpl->ctx;
+    return ctx->get_name();
+}
+
+static void llama_sampler_min_p_schedule_accept(struct llama_sampler * smpl, llama_token /*token*/) {
+    auto * ctx = (llama_sampler_min_p_schedule *) smpl->ctx;
+    if (ctx->applied) {
+        ctx->pos++;
+        ctx->applied = false;
+    }
+    // If !applied (prompt pre-feeding), no-op — position stays the same.
+}
+
+static void llama_sampler_min_p_schedule_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * ctx = (llama_sampler_min_p_schedule *) smpl->ctx;
+
+    float p = 0.0f;
+    float fpos = (float)ctx->pos;
+    switch (ctx->interp) {
+        case LLAMA_MIN_P_SCHEDULE_INTERP_STEP:   p = min_p_schedule_step  (ctx->points, fpos); break;
+        case LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR: p = min_p_schedule_linear(ctx->points, fpos); break;
+        case LLAMA_MIN_P_SCHEDULE_INTERP_CUBIC:  p = min_p_schedule_cubic (ctx->points, fpos); break;
+    }
+
+    llama_sampler_min_p_impl(cur_p, p, ctx->min_keep);
+    ctx->applied = true;
+}
+
+static void llama_sampler_min_p_schedule_reset(struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_min_p_schedule *) smpl->ctx;
+    ctx->pos = 0;
+    ctx->applied = false;
+}
+
+static struct llama_sampler * llama_sampler_min_p_schedule_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const llama_sampler_min_p_schedule *) smpl->ctx;
+    return llama_sampler_init(
+        smpl->iface,
+        new llama_sampler_min_p_schedule {
+            ("min-p-schedule"),
+            /* .points   = */ ctx->points,
+            /* .interp   = */ ctx->interp,
+            /* .min_keep = */ ctx->min_keep,
+            /* .pos      = */ ctx->pos,
+            /* .applied  = */ ctx->applied,
+        }
+    );
+}
+
+static void llama_sampler_min_p_schedule_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_min_p_schedule *) smpl->ctx;
+}
+
+static struct llama_sampler_i llama_sampler_min_p_schedule_i = {
+    /* .name              = */ llama_sampler_min_p_schedule_name,
+    /* .accept            = */ llama_sampler_min_p_schedule_accept,
+    /* .apply             = */ llama_sampler_min_p_schedule_apply,
+    /* .reset             = */ llama_sampler_min_p_schedule_reset,
+    /* .clone             = */ llama_sampler_min_p_schedule_clone,
+    /* .free              = */ llama_sampler_min_p_schedule_free,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+};
+
+std::vector<std::pair<float, float>> llama_min_p_schedule_prepare_points(
+        const std::vector<std::pair<float, float>> & raw,
+        bool    normalized,
+        int32_t n_predict) {
+    std::vector<std::pair<float, float>> pts;
+    pts.reserve(raw.size());
+    for (const auto & cp : raw) {
+        if (!std::isfinite(cp.first) || !std::isfinite(cp.second)) {
+            continue;
+        }
+        pts.emplace_back(cp.first, cp.second);
+    }
+
+    if (normalized) {
+        if (n_predict <= 0) {
+            return {};
+        }
+        float scale = (float)(n_predict - 1);
+        if (n_predict == 1) { scale = 0.0f; }
+        for (auto & cp : pts) {
+            cp.first *= scale;
+        }
+    }
+
+    std::stable_sort(pts.begin(), pts.end(), [](const std::pair<float, float> & a, const std::pair<float, float> & b) {
+        return a.first < b.first;
+    });
+
+    {
+        const float eps = 1e-6f;
+        std::vector<std::pair<float, float>> deduped;
+        deduped.reserve(pts.size());
+        for (size_t i = 0; i < pts.size(); i++) {
+            if (i + 1 < pts.size() && std::fabs(pts[i].first - pts[i + 1].first) < eps) {
+                continue; // skip, keep the later one
+            }
+            deduped.push_back(pts[i]);
+        }
+        pts = std::move(deduped);
+    }
+
+    return pts;
+}
+
+struct llama_sampler * llama_sampler_init_min_p_schedule(
+        const float * points,
+        int32_t       n_points,
+        enum llama_min_p_schedule_interp interp,
+        bool          normalized,
+        int32_t       n_predict,
+        size_t        min_keep) {
+    if (n_points <= 0 || points == nullptr) {
+        return llama_sampler_init_empty("?min-p-schedule");
+    }
+
+    if (normalized && n_predict <= 0) {
+        LLAMA_LOG_WARN("%s: normalized min-p schedule requires n_predict > 0, returning no-op\n", __func__);
+        return llama_sampler_init_empty("?min-p-schedule");
+    }
+
+    std::vector<std::pair<float, float>> raw;
+    raw.reserve((size_t)n_points);
+    for (int32_t i = 0; i < n_points; i++) {
+        raw.emplace_back(points[i * 2], points[i * 2 + 1]);
+    }
+
+    auto pts = llama_min_p_schedule_prepare_points(raw, normalized, n_predict);
+
+    if (pts.empty()) {
+        return llama_sampler_init_empty("?min-p-schedule");
+    }
+
+    return llama_sampler_init(
+        /* .iface = */ &llama_sampler_min_p_schedule_i,
+        /* .ctx   = */ new llama_sampler_min_p_schedule {
+            ("min-p-schedule"),
+            /* .points   = */ std::move(pts),
+            /* .interp   = */ interp,
+            /* .min_keep = */ min_keep,
+            /* .pos      = */ 0,
+            /* .applied  = */ false,
         }
     );
 }

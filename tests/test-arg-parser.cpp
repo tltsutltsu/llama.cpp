@@ -249,5 +249,96 @@ int main(void) {
         assert(sparams.temp_schedule.empty());
     }
 
+    // test --min-p-schedule-normalized with --n-predict: points stay RAW (D1 contract)
+    printf("test-arg-parser: test --min-p-schedule-normalized parsing (D1: raw storage)\n\n");
+    {
+        common_params fresh;
+        argv = {"binary_name", "--min-p-schedule-normalized", "0:0.0,1:0.3", "--predict", "100"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fresh, LLAMA_EXAMPLE_COMMON));
+        assert(fresh.sampling.min_p_schedule.size() == 2);
+        assert(fabs(fresh.sampling.min_p_schedule[0].first - 0.0f) < 0.01f);
+        assert(fabs(fresh.sampling.min_p_schedule[0].second - 0.0f) < 0.01f);
+        assert(fabs(fresh.sampling.min_p_schedule[1].first - 1.0f) < 0.01f);  // RAW, not 99
+        assert(fabs(fresh.sampling.min_p_schedule[1].second - 0.3f) < 0.01f);
+        assert(fresh.sampling.min_p_schedule_needs_normalization == true);
+        assert(fresh.sampling.min_p_schedule_n_predict == 100);
+        assert(fresh.sampling.user_sampling_config & COMMON_PARAMS_SAMPLING_CONFIG_MIN_P_SCHEDULE);
+    }
+
+    // order-independence: --n-predict before schedule
+    printf("test-arg-parser: test --min-p-schedule-normalized order-independence\n\n");
+    {
+        common_params fresh;
+        argv = {"binary_name", "--predict", "100", "--min-p-schedule-normalized", "0:0.0,1:0.3"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fresh, LLAMA_EXAMPLE_COMMON));
+        assert(fresh.sampling.min_p_schedule.size() == 2);
+        assert(fabs(fresh.sampling.min_p_schedule[1].first - 1.0f) < 0.01f);
+        assert(fresh.sampling.min_p_schedule_n_predict == 100);
+    }
+
+    // --min-p-schedule absolute: needs_normalization = false, points unchanged
+    printf("test-arg-parser: test --min-p-schedule absolute parsing\n\n");
+    {
+        common_params fresh;
+        argv = {"binary_name", "--min-p-schedule", "0:0.0,50:0.3", "--predict", "100"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fresh, LLAMA_EXAMPLE_COMMON));
+        assert(fresh.sampling.min_p_schedule.size() == 2);
+        assert(fabs(fresh.sampling.min_p_schedule[1].first - 50.0f) < 0.01f);
+        assert(fresh.sampling.min_p_schedule_needs_normalization == false);
+        assert(fresh.sampling.min_p_schedule_n_predict == 100);
+    }
+
+    // negative: --min-p-schedule-normalized without --n-predict must throw
+    printf("test-arg-parser: test --min-p-schedule-normalized without --n-predict\n\n");
+    {
+        common_params fresh;
+        argv = {"binary_name", "--min-p-schedule-normalized", "0:0.0,1:0.3"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fresh, LLAMA_EXAMPLE_COMMON));
+    }
+
+    // sanitizer interaction: mirostat set explicitly on CLI triggers sanitizer, which clears
+    // the schedule, so the post-sanitize validator does NOT fire (no --n-predict needed).
+    printf("test-arg-parser: test --mirostat + --min-p-schedule-normalized (no --n-predict) ok\n\n");
+    {
+        common_params fresh;
+        argv = {"binary_name", "--mirostat", "1", "--min-p-schedule-normalized", "0:0.0,1:0.3"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fresh, LLAMA_EXAMPLE_COMMON));
+        assert(fresh.sampling.min_p_schedule.empty());
+        assert(fresh.sampling.min_p_schedule_needs_normalization == false);
+        assert(fresh.sampling.min_p_schedule_n_predict == 0);
+    }
+
+    // interp parsing
+    printf("test-arg-parser: test --min-p-schedule-interp\n\n");
+    {
+        common_params fresh;
+        argv = {"binary_name", "--min-p-schedule-interp", "cubic"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fresh, LLAMA_EXAMPLE_COMMON));
+        assert(fresh.sampling.min_p_schedule_interp == LLAMA_MIN_P_SCHEDULE_INTERP_CUBIC);
+    }
+    {
+        common_params fresh;
+        argv = {"binary_name", "--min-p-schedule-interp", "bogus"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fresh, LLAMA_EXAMPLE_COMMON));
+    }
+
+    // sanitizer: MIN_P absent from sampler sequence clears the schedule + all companion fields
+    printf("test-arg-parser: test min-p schedule sanitization\n\n");
+    {
+        common_params_sampling sparams;
+        sparams.min_p_schedule = {{0.0f, 0.05f}, {100.0f, 0.3f}};
+        sparams.min_p_schedule_needs_normalization = true;
+        sparams.min_p_schedule_n_predict = 100;
+        sparams.samplers = {
+            COMMON_SAMPLER_TYPE_TOP_K,
+            COMMON_SAMPLER_TYPE_TOP_P,
+            // MIN_P intentionally omitted
+        };
+        common_sampler_sanitize_min_p_schedule(sparams);
+        assert(sparams.min_p_schedule.empty());
+        assert(sparams.min_p_schedule_needs_normalization == false);
+        assert(sparams.min_p_schedule_n_predict == 0);
+    }
+
     printf("test-arg-parser: all tests OK\n\n");
 }

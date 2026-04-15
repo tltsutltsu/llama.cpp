@@ -115,6 +115,30 @@ llama_sampler * llama_sampler_init_llg(const llama_vocab * vocab,
 // Sanitize temp_schedule: clear if TEMPERATURE is not in the sampler sequence or mirostat is active.
 void common_sampler_sanitize_temp_schedule(common_params_sampling & params);
 
+// Clear min_p_schedule and reset its companion fields (needs_normalization, n_predict) atomically.
+// This is the single source of the state-reset invariant: whenever min_p_schedule becomes empty,
+// the flag and cached n_predict must also be zeroed.
+void common_sampler_clear_min_p_schedule(common_params_sampling & params);
+
+// Sanitize min_p_schedule: clear if MIN_P is not in the sampler sequence or mirostat is active.
+void common_sampler_sanitize_min_p_schedule(common_params_sampling & params);
+
+// Read-only display helper. Returns the exact point set the runtime ctor would use: runs the full
+// transformation pipeline (filter non-finite, optional normalize via n_predict - 1, stable_sort by
+// position, epsilon dedupe "last wins"), without mutating input params.
+//
+// Must mirror llama_sampler_init_min_p_schedule — any transformation the ctor performs has to be
+// replayed here, otherwise display surfaces (server to_json, /props, CLI print) can echo a curve
+// different from what the sampler actually used for unsorted/duplicate/non-finite inputs.
+//
+// Note on duplication: common/ links against llama, but llama does NOT link against common. A
+// parallel implementation lives in src/llama-sampler.cpp (llama_min_p_schedule_prepare_points);
+// tests/test-sampling.cpp runs a parity battery to pin the two bodies together byte-for-byte.
+std::vector<std::pair<float, float>> common_sampler_resolve_min_p_schedule_positions(
+        const std::vector<std::pair<float, float>> & points,
+        bool    needs_normalization,
+        int32_t n_predict);
+
 struct common_sampler_deleter {
     void operator()(common_sampler * s) { common_sampler_free(s); }
 };

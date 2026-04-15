@@ -149,6 +149,9 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--temp-schedule SCHEDULE` | temperature schedule as `pos0:temp0,pos1:temp1,...` (absolute token positions). Overrides `--temp` and `--dynatemp-range`. |
 | `--temp-schedule-normalized SCHEDULE` | temperature schedule as `frac0:temp0,frac1:temp1,...` where positions are fractions of `--n-predict` (0.0–1.0). Requires `--n-predict > 0`. |
 | `--temp-schedule-interp METHOD` | temperature schedule interpolation: `step`, `linear`, or `cubic` (Catmull-Rom). Default: `linear`. |
+| `--min-p-schedule SCHEDULE` | min-p schedule as `pos0:p0,pos1:p1,...` (absolute token positions). Overrides `--min-p`. |
+| `--min-p-schedule-normalized SCHEDULE` | min-p schedule as `frac0:p0,frac1:p1,...` where positions are fractions of `--n-predict` (0.0–1.0). Requires `--n-predict > 0`. |
+| `--min-p-schedule-interp METHOD` | min-p schedule interpolation: `step`, `linear`, or `cubic` (Catmull-Rom, clamped to `[0, 1]`). Default: `linear`. |
 | `--mirostat N` | use Mirostat sampling.<br/>Top K, Nucleus and Locally Typical samplers are ignored if used.<br/>(default: 0, 0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0) |
 | `--mirostat-lr N` | Mirostat learning rate, parameter eta (default: 0.10) |
 | `--mirostat-ent N` | Mirostat target entropy, parameter tau (default: 5.00) |
@@ -423,6 +426,16 @@ Note for `multimodal_data` in JSON object prompts. This should be an array of st
 `temperature_schedule_normalized`: When `true`, treat `temperature_schedule` positions as fractions of `n_predict` (0.0–1.0) instead of absolute token positions. Requires `n_predict > 0`. Only applied when `temperature_schedule` is also present in the same request. Default: `false`.
 
 **Limitations**: The position counter resets to 0 at the start of each generation and counts only generated tokens (prompt tokens do not advance the counter). If continuing a previous generation (appending to an existing completion), the schedule restarts from position 0. Normalized position 1.0 maps to position `n_predict - 1` (the last generated token).
+
+`min_p_schedule`: Array of `[position, min_p]` pairs defining a position-dependent min-p curve. When set, overrides the fixed `min_p` field. Example: `[[0, 0.0], [50, 0.1], [200, 0.3]]`. Default: not set. Values are clamped to `[0, 1]` on both ends (cubic interpolation cannot overshoot).
+
+`min_p_interpolation`: Interpolation method for `min_p_schedule`. One of `"step"`, `"linear"`, or `"cubic"` (Catmull-Rom spline). Default: `"linear"`.
+
+`min_p_schedule_normalized`: When `true`, treat `min_p_schedule` positions as fractions of `n_predict` (0.0–1.0) instead of absolute token positions. Requires `n_predict > 0`. Only applied when `min_p_schedule` is also present in the same request. Default: `false`.
+
+**Precedence** (diverges from `temperature_schedule`): if a request body contains `min_p` but not `min_p_schedule`, the scalar `min_p` wins and any server-default `min_p_schedule` is cleared for that request. This is an explicit opt-out — set both fields to use the schedule alongside a placeholder scalar, or leave `min_p` unset to inherit the schedule.
+
+**Limitations**: Same per-generation reset behavior as `temperature_schedule`. Additionally, because `MIN_P` sits earlier in the default sampler chain than `TEMPERATURE`, enabling a `min_p_schedule` pushes more of the sampler chain back onto the CPU path than `temperature_schedule` does (any non-backend sampler short-circuits backend-sampling from its position onward). Expect reduced throughput when this schedule is active.
 
 `top_k`: Limit the next token selection to the K most probable tokens.  Default: `40`
 

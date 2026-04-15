@@ -1358,6 +1358,29 @@ extern "C" {
             bool          normalized,
             int32_t       n_predict);
 
+    enum llama_min_p_schedule_interp {
+        LLAMA_MIN_P_SCHEDULE_INTERP_STEP   = 0,
+        LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR = 1,
+        LLAMA_MIN_P_SCHEDULE_INTERP_CUBIC  = 2, // Catmull-Rom spline
+    };
+
+    /// @details Min-p schedule sampler — position-dependent min-p filter.
+    /// @param points     Interleaved [pos0, p0, pos1, p1, ...]. Copied internally.
+    /// @param n_points   Number of (position, p) pairs.
+    /// @param interp     Interpolation mode (step, linear, cubic).
+    /// @param normalized If true, position values are fractions of n_predict (0.0–1.0).
+    ///                   Requires n_predict > 0.
+    /// @param n_predict  Total expected generation length. Only used when normalized=true.
+    ///                   Ignored (pass 0) when normalized=false.
+    /// @param min_keep   Minimum number of candidates to keep after filtering (passed through to min-p filter).
+    LLAMA_API struct llama_sampler * llama_sampler_init_min_p_schedule(
+            const float * points,
+            int32_t       n_points,
+            enum llama_min_p_schedule_interp interp,
+            bool          normalized,
+            int32_t       n_predict,
+            size_t        min_keep);
+
     /// @details XTC sampler as described in https://github.com/oobabooga/text-generation-webui/pull/6335
     LLAMA_API struct llama_sampler * llama_sampler_init_xtc        (float   p, float   t,     size_t min_keep, uint32_t seed);
 

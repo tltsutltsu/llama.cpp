@@ -658,8 +658,9 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        // Sanitize temp_schedule in server defaults after model metadata may have altered sampling params
+        // Sanitize schedules in server defaults after model metadata may have altered sampling params
         common_sampler_sanitize_temp_schedule(params_base.sampling);
+        common_sampler_sanitize_min_p_schedule(params_base.sampling);
 
         if (params_base.speculative.has_dft()) {
             SRV_INF("loading draft model '%s'\n", params_base.speculative.mparams_dft.path.c_str());
@@ -3524,7 +3525,8 @@ void server_routes::init_routes() {
         GGML_UNUSED(ctx_server);
 
         task_params tparams;
-        tparams.sampling = params.sampling;
+        tparams.sampling  = params.sampling;
+        tparams.n_predict = params.n_predict; // required so normalized-schedule display helpers can resolve positions
         json default_generation_settings_for_props = json {
             { "params", tparams.to_json(true) },
             { "n_ctx",  meta->slot_n_ctx },

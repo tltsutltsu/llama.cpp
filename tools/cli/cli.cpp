@@ -353,6 +353,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Unconditional: bypass the logger verbosity threshold so the sampler params land on stderr
+    // regardless of --verbose. Useful for confirming --temp-schedule / --min-p-schedule wiring.
+    fprintf(stderr, "sampler params: %s\n", params.sampling.print().c_str());
+
     // TODO: maybe support it later?
     if (params.conversation_mode == COMMON_CONVERSATION_MODE_DISABLED) {
         console::error("--no-conversation is not supported by llama-cli\n");

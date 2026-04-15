@@ -168,6 +168,7 @@ enum common_params_sampling_config : uint64_t {
     COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA    = 1 << 11,
     COMMON_PARAMS_SAMPLING_CONFIG_TEMP_SCHEDULE   = 1 << 12,
     COMMON_PARAMS_SAMPLING_CONFIG_DYNATEMP_RANGE  = 1 << 13,
+    COMMON_PARAMS_SAMPLING_CONFIG_MIN_P_SCHEDULE  = 1 << 14,
 };
 
 enum common_speculative_type {
@@ -238,6 +239,10 @@ struct common_params_sampling {
     std::vector<std::pair<float, float>> temp_schedule;          // position-dependent temperature control points
     llama_temp_schedule_interp temp_schedule_interp = LLAMA_TEMP_SCHEDULE_INTERP_LINEAR;
     bool temp_schedule_needs_normalization = false;               // transient: set by --temp-schedule-normalized, consumed by post-parse step
+    std::vector<std::pair<float, float>> min_p_schedule;         // position-dependent min-p control points (raw; ctor resolves normalization)
+    llama_min_p_schedule_interp min_p_schedule_interp = LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR;
+    bool    min_p_schedule_needs_normalization = false;          // stored alongside schedule; ctor scales positions when true
+    int32_t min_p_schedule_n_predict           = 0;              // cached from params.n_predict at parse time; consumed by the ctor
     int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty, -1 = context size)
     float   penalty_repeat     = 1.00f;  // 1.0 = disabled
     float   penalty_freq       = 0.00f;  // 0.0 = disabled

@@ -54,6 +54,29 @@ json task_params::to_json(bool only_metrics) const {
         }
     };
 
+    // min-p schedule emit helpers. Positions are echoed as the resolved absolute set the sampler
+    // ctor will actually use (filter + normalize + sort + dedupe). Never emit `min_p_schedule_normalized`.
+    auto min_p_schedule_to_json = [&](const std::vector<std::pair<float, float>> & schedule) {
+        auto resolved = common_sampler_resolve_min_p_schedule_positions(
+            schedule,
+            sampling.min_p_schedule_needs_normalization,
+            sampling.min_p_schedule_n_predict);
+        json arr = json::array();
+        for (const auto & cp : resolved) {
+            arr.push_back(json::array({cp.first, cp.second}));
+        }
+        return arr;
+    };
+
+    auto min_p_interp_to_str = [](llama_min_p_schedule_interp interp) -> std::string {
+        switch (interp) {
+            case LLAMA_MIN_P_SCHEDULE_INTERP_STEP:   return "step";
+            case LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR: return "linear";
+            case LLAMA_MIN_P_SCHEDULE_INTERP_CUBIC:  return "cubic";
+            default:                                 return "linear";
+        }
+    };
+
     if (only_metrics) {
         json result = {
             {"seed",                      sampling.seed},
@@ -106,6 +129,10 @@ json task_params::to_json(bool only_metrics) const {
         if (!sampling.temp_schedule.empty()) {
             result["temperature_schedule"]      = temp_schedule_to_json(sampling.temp_schedule);
             result["temperature_interpolation"] = temp_interp_to_str(sampling.temp_schedule_interp);
+        }
+        if (!sampling.min_p_schedule.empty()) {
+            result["min_p_schedule"]      = min_p_schedule_to_json(sampling.min_p_schedule);
+            result["min_p_interpolation"] = min_p_interp_to_str(sampling.min_p_schedule_interp);
         }
         return result;
     }
@@ -174,6 +201,10 @@ json task_params::to_json(bool only_metrics) const {
     if (!sampling.temp_schedule.empty()) {
         result["temperature_schedule"]      = temp_schedule_to_json(sampling.temp_schedule);
         result["temperature_interpolation"] = temp_interp_to_str(sampling.temp_schedule_interp);
+    }
+    if (!sampling.min_p_schedule.empty()) {
+        result["min_p_schedule"]      = min_p_schedule_to_json(sampling.min_p_schedule);
+        result["min_p_interpolation"] = min_p_interp_to_str(sampling.min_p_schedule_interp);
     }
     return result;
 }
@@ -370,6 +401,63 @@ task_params server_task::params_from_json_cmpl(
         }
     } else {
         params.sampling.temp_schedule_interp = defaults.sampling.temp_schedule_interp;
+    }
+
+    // min-p schedule (D1: store raw + flag + cached n_predict; ctor resolves normalization)
+    //
+    // Triple-inheritance table:
+    //   request has neither schedule nor flag           -> inherit (schedule + flag) from defaults
+    //   request has schedule (with or without flag)     -> request schedule; flag = request value (default false)
+    //   request has flag only (no schedule key)         -> lone flag ignored; inherit pair from defaults
+    //
+    // n_predict is always the request's effective n_predict (never startup's); this lets an
+    // inherited normalized default resolve against the per-request token budget.
+    if (data.contains("min_p_schedule")) {
+        common_sampler_clear_min_p_schedule(params.sampling);
+        const auto & sched = data.at("min_p_schedule");
+        if (sched.is_array()) {
+            for (const auto & pt : sched) {
+                if (pt.is_array() && pt.size() == 2) {
+                    params.sampling.min_p_schedule.emplace_back(pt[0].get<float>(), pt[1].get<float>());
+                }
+            }
+        }
+
+        if (!params.sampling.min_p_schedule.empty()
+            && data.contains("min_p_schedule_normalized")
+            && data.at("min_p_schedule_normalized").get<bool>()) {
+            params.sampling.min_p_schedule_needs_normalization = true;
+        }
+
+        // D3: request schedule wins over request scalar
+        if (data.contains("min_p") && !params.sampling.min_p_schedule.empty()) {
+            SRV_WRN("%s\n", "min_p_schedule overrides min_p");
+        }
+    } else if (data.contains("min_p")) {
+        // D3: scalar-only request clears the inherited schedule (explicit opt-out)
+        common_sampler_clear_min_p_schedule(params.sampling);
+    } else {
+        // Inherit schedule + flag pair from defaults
+        params.sampling.min_p_schedule                     = defaults.sampling.min_p_schedule;
+        params.sampling.min_p_schedule_needs_normalization = defaults.sampling.min_p_schedule_needs_normalization;
+    }
+
+    // n_predict cache: always the request's effective n_predict (never startup's)
+    params.sampling.min_p_schedule_n_predict = params.n_predict;
+
+    if (data.contains("min_p_interpolation")) {
+        std::string interp_str = data.at("min_p_interpolation").get<std::string>();
+        if (interp_str == "step") {
+            params.sampling.min_p_schedule_interp = LLAMA_MIN_P_SCHEDULE_INTERP_STEP;
+        } else if (interp_str == "linear") {
+            params.sampling.min_p_schedule_interp = LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR;
+        } else if (interp_str == "cubic") {
+            params.sampling.min_p_schedule_interp = LLAMA_MIN_P_SCHEDULE_INTERP_CUBIC;
+        } else {
+            throw std::runtime_error("Error: invalid min_p_interpolation value: " + interp_str + " (must be step, linear, or cubic)");
+        }
+    } else {
+        params.sampling.min_p_schedule_interp = defaults.sampling.min_p_schedule_interp;
     }
 
     params.sampling.penalty_last_n     = json_value(data, "repeat_last_n",       defaults.sampling.penalty_last_n);
@@ -695,6 +783,15 @@ task_params server_task::params_from_json_cmpl(
     // This catches stale schedules inherited from server defaults when model metadata changes
     // the sampler sequence or enables mirostat after startup.
     common_sampler_sanitize_temp_schedule(params.sampling);
+    common_sampler_sanitize_min_p_schedule(params.sampling);
+
+    // Validate min-p schedule after sanitize — only the final resolved non-empty schedule counts.
+    // Empty schedule + lone flag is OK; a schedule cleared by mirostat/sampler-absent is OK.
+    if (!params.sampling.min_p_schedule.empty()
+        && params.sampling.min_p_schedule_needs_normalization
+        && params.sampling.min_p_schedule_n_predict <= 0) {
+        throw std::runtime_error("Error: min_p_schedule_normalized requires n_predict > 0");
+    }
 
     return params;
 }

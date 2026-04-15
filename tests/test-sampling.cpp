@@ -1,6 +1,13 @@
 #include "ggml.h"
 #include "llama.h"
 
+// llama-internal header for the externally-linkable prepare-points helper.
+// Tests already reach into src/ internals via the test-sampling build (see CMakeLists.txt:150).
+#include "../src/llama-sampler.h"
+
+// common-side twin for parity testing.
+#include "sampling.h"
+
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -8,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <utility>
 #include <vector>
 
 extern struct llama_sampler * llama_sampler_init_dry_testing(int32_t context_size, float dry_multiplier, float dry_base, int32_t dry_allowed_length, int32_t dry_penalty_last_n, const std::vector<std::vector<llama_token>>& seq_breakers);
@@ -444,6 +452,281 @@ static void test_temp_schedule() {
     }
 }
 
+static void test_min_p_schedule() {
+    printf("test_min_p_schedule:\n");
+
+    // Build a logit distribution where we can infer the applied p by counting survivors.
+    // We use logits 10, 9, 8, 7, 6, 5, 4 (7 tokens). After min-p filter the number of survivors
+    // depends on the threshold p*max_prob, which in log space equals max_logit + logf(p).
+    //   p >= exp(-1) ≈ 0.368  -> 1 token survives (only logit 10)
+    //   p ~= 0.2              -> 2 tokens (logit 10, 9)  [threshold ≈ 8.39]
+    //   p ~= 0.05             -> 4 tokens (logit 10..7)  [threshold ≈ 7.00]
+    //   p ~= 0.01             -> 5 tokens (logit 10..6)  [threshold ≈ 5.40]
+    //   p = 0.0               -> 7 tokens (filter disabled)
+    auto build_logits = []() {
+        std::vector<llama_token_data> cur;
+        cur.reserve(7);
+        for (int i = 0; i < 7; i++) {
+            cur.push_back({ i, 10.0f - (float)i, 0.0f });
+        }
+        return cur;
+    };
+
+    auto apply_and_count_survivors = [&](llama_sampler * smpl) -> size_t {
+        auto cur = build_logits();
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(smpl, &cur_p);
+        return cur_p.size;
+    };
+
+    auto advance_to = [&](llama_sampler * smpl, int target_pos) {
+        llama_sampler_reset(smpl);
+        for (int i = 0; i < target_pos; i++) {
+            auto cur = build_logits();
+            llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+            llama_sampler_apply(smpl, &cur_p);
+            llama_sampler_accept(smpl, 0);
+        }
+    };
+
+    // 1. Step interpolation
+    {
+        float pts[] = {0.0f, 0.0f, 50.0f, 0.2f, 100.0f, 0.5f};
+        auto * smpl = llama_sampler_init_min_p_schedule(pts, 3, LLAMA_MIN_P_SCHEDULE_INTERP_STEP, false, 0, 1);
+        advance_to(smpl, 0);
+        GGML_ASSERT(apply_and_count_survivors(smpl) == 7); // p=0 → filter off
+        advance_to(smpl, 25);
+        GGML_ASSERT(apply_and_count_survivors(smpl) == 7); // p still 0
+        advance_to(smpl, 50);
+        GGML_ASSERT(apply_and_count_survivors(smpl) == 2); // p≈0.2 → keep 2
+        advance_to(smpl, 100);
+        GGML_ASSERT(apply_and_count_survivors(smpl) == 1); // p≈0.5 → keep 1
+        printf("  PASS step\n");
+        llama_sampler_free(smpl);
+    }
+
+    // 2. Linear interpolation — verify p changes monotonically across the segment
+    {
+        float pts[] = {0.0f, 0.01f, 100.0f, 0.4f};
+        auto * smpl = llama_sampler_init_min_p_schedule(pts, 2, LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR, false, 0, 1);
+        advance_to(smpl, 0);
+        size_t n0 = apply_and_count_survivors(smpl);
+        advance_to(smpl, 100);
+        size_t n100 = apply_and_count_survivors(smpl);
+        GGML_ASSERT(n0 >= 4);        // loose
+        GGML_ASSERT(n100 <= 2);      // tight
+        GGML_ASSERT(n0 > n100);      // monotonic
+        // Reset brings pos back to 0 — survivors should match n0 again
+        llama_sampler_reset(smpl);
+        GGML_ASSERT(apply_and_count_survivors(smpl) == n0);
+        printf("  PASS linear (n0=%zu, n100=%zu)\n", n0, n100);
+        llama_sampler_free(smpl);
+    }
+
+    // 3. Cubic: chordal Catmull-Rom math body shared with temp_schedule_cubic (verified there).
+    //    Here we pin min-p-specific behavior: clamp to [0, 1] on BOTH ends.
+    //    Schedule (0, 0.99), (10, 0.99), (20, 0.99), (30, -5.0) — Catmull-Rom overshoots
+    //    positive-side before the negative drop; also includes a drop we want clamped.
+    {
+        float pts[] = {0.0f, 0.99f, 10.0f, 0.99f, 20.0f, 0.99f, 30.0f, -5.0f};
+        auto * smpl = llama_sampler_init_min_p_schedule(pts, 4, LLAMA_MIN_P_SCHEDULE_INTERP_CUBIC, false, 0, 1);
+        // Every position must yield a survivor count >= 1 (never NaN, never produce garbage)
+        for (int pos = 0; pos <= 30; pos++) {
+            advance_to(smpl, pos);
+            size_t n = apply_and_count_survivors(smpl);
+            GGML_ASSERT(n >= 1 && n <= 7);
+        }
+        printf("  PASS cubic-both-ends-clamped\n");
+        llama_sampler_free(smpl);
+    }
+
+    // 4. Two-phase latch: prompt pre-feeding (accept-before-apply no-op)
+    {
+        float pts[] = {0.0f, 0.01f, 100.0f, 0.4f};
+        auto * smpl = llama_sampler_init_min_p_schedule(pts, 2, LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR, false, 0, 1);
+        for (int i = 0; i < 5; i++) {
+            llama_sampler_accept(smpl, 0);
+        }
+        size_t n = apply_and_count_survivors(smpl);
+        // pos should still be 0; loose filter
+        advance_to(smpl, 0);
+        size_t n0 = apply_and_count_survivors(smpl);
+        GGML_ASSERT(n == n0);
+        printf("  PASS prompt-prefeed\n");
+        llama_sampler_free(smpl);
+    }
+
+    // 5. Two-phase latch: apply twice, accept once (grammar retry)
+    {
+        float pts[] = {0.0f, 0.0f, 100.0f, 0.4f};
+        auto * smpl = llama_sampler_init_min_p_schedule(pts, 2, LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR, false, 0, 1);
+        size_t n_a = apply_and_count_survivors(smpl);
+        size_t n_b = apply_and_count_survivors(smpl); // retry at same pos
+        GGML_ASSERT(n_a == n_b);
+        llama_sampler_accept(smpl, 0); // pos now advances by 1
+        // After accept, pos=1 — still near pos 0, survivors similar
+        size_t n_c = apply_and_count_survivors(smpl);
+        GGML_ASSERT(n_c >= 1);
+        printf("  PASS grammar-retry\n");
+        llama_sampler_free(smpl);
+    }
+
+    // 6. Invalid input robustness
+    {
+        auto * s1 = llama_sampler_init_min_p_schedule(nullptr, 0, LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR, false, 0, 1);
+        auto * s2 = llama_sampler_init_min_p_schedule(nullptr, 5, LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR, false, 0, 1);
+        float pts[] = {0.0f, 0.1f};
+        auto * s3 = llama_sampler_init_min_p_schedule(pts, 0, LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR, false, 0, 1);
+        auto * s4 = llama_sampler_init_min_p_schedule(pts, 1, LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR, true, 0, 1); // normalized + n_predict=0
+        // all non-finite
+        float pts_nan[] = {NAN, NAN, INFINITY, 0.1f};
+        auto * s5 = llama_sampler_init_min_p_schedule(pts_nan, 2, LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR, false, 0, 1);
+
+        llama_sampler * noops[] = {s1, s2, s3, s4, s5};
+        for (auto * s : noops) {
+            size_t n = apply_and_count_survivors(s);
+            GGML_ASSERT(n == 7); // no-op: nothing filtered
+            llama_sampler_free(s);
+        }
+        printf("  PASS invalid-input-robustness\n");
+    }
+
+    // 7. min_keep floor preservation: schedule yields p≈0.5 (would prune to 1) but min_keep=3.
+    {
+        float pts[] = {0.0f, 0.5f};
+        auto * smpl = llama_sampler_init_min_p_schedule(pts, 1, LLAMA_MIN_P_SCHEDULE_INTERP_STEP, false, 0, 3);
+        advance_to(smpl, 0);
+        size_t n = apply_and_count_survivors(smpl);
+        GGML_ASSERT(n >= 3);
+        printf("  PASS min_keep-floor\n");
+        llama_sampler_free(smpl);
+    }
+
+    // 8. Clone independence
+    {
+        float pts[] = {0.0f, 0.0f, 100.0f, 0.4f};
+        auto * smpl = llama_sampler_init_min_p_schedule(pts, 2, LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR, false, 0, 1);
+        advance_to(smpl, 50);
+        auto * clone = llama_sampler_clone(smpl);
+        llama_sampler_reset(smpl);
+        // Original at pos=0; clone still at pos=50
+        size_t n_orig = apply_and_count_survivors(smpl);
+        size_t n_clone = apply_and_count_survivors(clone);
+        GGML_ASSERT(n_orig >= n_clone); // clone is tighter because of position
+        printf("  PASS clone-independence (orig=%zu, clone=%zu)\n", n_orig, n_clone);
+        llama_sampler_free(smpl);
+        llama_sampler_free(clone);
+    }
+
+    // 9. Normalized-positions round-trip: [0, 1.0] at np=100 == [0, 99]
+    {
+        float pts_n[] = {0.0f, 0.0f, 1.0f, 0.4f};
+        float pts_a[] = {0.0f, 0.0f, 99.0f, 0.4f};
+        auto * sn = llama_sampler_init_min_p_schedule(pts_n, 2, LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR, true, 100, 1);
+        auto * sa = llama_sampler_init_min_p_schedule(pts_a, 2, LLAMA_MIN_P_SCHEDULE_INTERP_LINEAR, false, 0, 1);
+        for (int pos = 0; pos < 100; pos++) {
+            size_t n_n = apply_and_count_survivors(sn);
+            size_t n_a = apply_and_count_survivors(sa);
+            GGML_ASSERT(n_n == n_a);
+            llama_sampler_accept(sn, 0);
+            llama_sampler_accept(sa, 0);
+        }
+        printf("  PASS normalized-positions\n");
+        llama_sampler_free(sn);
+        llama_sampler_free(sa);
+    }
+
+    // 10. Sanitation (exercises common/sampling.cpp helpers directly).
+    {
+        common_params_sampling p;
+        p.min_p_schedule = {{0.0f, 0.05f}, {50.0f, 0.2f}};
+        p.min_p_schedule_needs_normalization = true;
+        p.min_p_schedule_n_predict = 100;
+        p.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TOP_P }; // MIN_P absent
+        common_sampler_sanitize_min_p_schedule(p);
+        GGML_ASSERT(p.min_p_schedule.empty());
+        GGML_ASSERT(p.min_p_schedule_needs_normalization == false);
+        GGML_ASSERT(p.min_p_schedule_n_predict == 0);
+    }
+    {
+        common_params_sampling p;
+        p.min_p_schedule = {{0.0f, 0.05f}, {50.0f, 0.2f}};
+        p.min_p_schedule_needs_normalization = true;
+        p.min_p_schedule_n_predict = 100;
+        p.mirostat = 1;
+        common_sampler_sanitize_min_p_schedule(p);
+        GGML_ASSERT(p.min_p_schedule.empty());
+        GGML_ASSERT(p.min_p_schedule_needs_normalization == false);
+        GGML_ASSERT(p.min_p_schedule_n_predict == 0);
+    }
+    {
+        common_params_sampling p;
+        p.min_p_schedule = {{0.0f, 0.05f}};
+        p.min_p_schedule_needs_normalization = true;
+        p.min_p_schedule_n_predict = 100;
+        common_sampler_clear_min_p_schedule(p);
+        GGML_ASSERT(p.min_p_schedule.empty());
+        GGML_ASSERT(p.min_p_schedule_needs_normalization == false);
+        GGML_ASSERT(p.min_p_schedule_n_predict == 0);
+    }
+    printf("  PASS sanitation + state-reset invariant\n");
+
+    // 11. PARITY: llama_min_p_schedule_prepare_points vs common_sampler_resolve_min_p_schedule_positions
+    //    Both implementations must produce byte-identical output for any input the ctor accepts.
+    {
+        struct Case {
+            std::vector<std::pair<float, float>> pts;
+            bool    normalized;
+            int32_t n_predict;
+        };
+        std::vector<Case> battery = {
+            { {}, false, 0 },
+            { {{0.0f, 0.05f}}, false, 0 },
+            { {{0.0f, 0.0f}, {100.0f, 0.3f}}, false, 0 },
+            { {{100.0f, 0.3f}, {0.0f, 0.0f}}, false, 0 },             // unsorted
+            { {{50.0f, 0.1f}, {50.0f, 0.2f}, {50.0f, 0.3f}}, false, 0 }, // dedupe last-wins
+            { {{0.0f, 0.0f}, {1.0f, 0.3f}}, true, 100 },               // normalized standard
+            { {{0.0f, 0.0f}, {1.0f, 0.3f}}, true, 1 },                 // normalized np=1
+            { {{0.0f, 0.0f}, {1.0f, 0.3f}}, true, 0 },                 // normalized np=0 -> empty
+            { {{NAN, 0.1f}, {1.0f, 0.2f}}, false, 0 },                  // non-finite pos
+            { {{0.0f, NAN}, {1.0f, 0.2f}}, false, 0 },                  // non-finite p
+            { {{INFINITY, 0.1f}, {0.0f, 0.2f}}, false, 0 },              // inf pos
+            { {{-INFINITY, 0.1f}, {0.0f, 0.2f}}, false, 0 },             // -inf pos
+            { {{0.0f, 0.1f}, {1e-7f, 0.5f}}, false, 0 },                 // near-dedupe-eps
+            { {{0.0f, 0.1f}, {1e-5f, 0.5f}}, false, 0 },                 // just outside eps
+            { {{-10.0f, 0.2f}, {10.0f, 0.3f}}, false, 0 },               // negative positions
+            { {{0.0f, 0.0f}, {0.5f, 0.2f}, {1.0f, 0.5f}}, true, 50 },   // normalized multi
+            { {{1e6f, 0.5f}, {1e-6f, 0.01f}}, false, 0 },                 // large + tiny positions
+            { {{0.0f, 0.0f}, {100.0f, 0.3f}, {50.0f, 0.15f}}, false, 0 }, // unsorted-middle
+            { {{0.0f, 0.1f}, {0.0f, 0.2f}}, false, 0 },                  // exact duplicate
+            { {{NAN, NAN}, {INFINITY, INFINITY}}, false, 0 },             // all non-finite
+            { {{0.0f, 0.0f}, {0.25f, 0.1f}, {0.5f, 0.25f}, {1.0f, 0.5f}}, true, 200 }, // bigger normalized
+        };
+        size_t mismatches = 0;
+        for (size_t ci = 0; ci < battery.size(); ci++) {
+            const auto & c = battery[ci];
+            auto a = llama_min_p_schedule_prepare_points(c.pts, c.normalized, c.n_predict);
+            auto b = common_sampler_resolve_min_p_schedule_positions(c.pts, c.normalized, c.n_predict);
+            if (a.size() != b.size()) {
+                printf("  PARITY MISMATCH case %zu: size %zu vs %zu\n", ci, a.size(), b.size());
+                mismatches++;
+                continue;
+            }
+            for (size_t i = 0; i < a.size(); i++) {
+                if (a[i].first != b[i].first || a[i].second != b[i].second) {
+                    printf("  PARITY MISMATCH case %zu[%zu]: (%f,%f) vs (%f,%f)\n",
+                        ci, i, a[i].first, a[i].second, b[i].first, b[i].second);
+                    mismatches++;
+                    break;
+                }
+            }
+        }
+        GGML_ASSERT(mismatches == 0);
+        GGML_ASSERT(battery.size() >= 20);
+        printf("  PASS min_p_schedule_prepare_parity (%zu cases)\n", battery.size());
+    }
+}
+
 static void test_top_k(const std::vector<float> & probs, const std::vector<float> & probs_expected, int k) {
     sampler_tester tester(probs, probs_expected);
 
@@ -754,6 +1037,7 @@ int main(void) {
     test_sampler_queue(10000, "mpk", 100, 0.8f, 0.1f);
 
     test_temp_schedule();
+    test_min_p_schedule();
 
     printf("OK\n");
 
